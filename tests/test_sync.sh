@@ -226,7 +226,7 @@ rm -f "$MOCK_BIN/rsync"
 # Create a restricted bin directory without rsync
 NO_RSYNC_BIN="$TEST_SANDBOX/no_rsync_bin"
 mkdir -p "$NO_RSYNC_BIN"
-for tool in sh basename dirname cat cp rm mkdir mktemp date stat cmp grep sed awk tr head ls find tar tee chmod sync sleep touch wc; do
+for tool in sh basename dirname cat cp rm mkdir mktemp date stat cmp grep sed awk tr head ls find tar gzip tee chmod sync sleep touch wc; do
     if command -v "$tool" >/dev/null 2>&1; then
         ln -sf "$(command -v "$tool")" "$NO_RSYNC_BIN/$tool"
     fi

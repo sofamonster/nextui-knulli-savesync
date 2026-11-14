@@ -116,7 +116,6 @@ KEYBOARD_BIN="$(find_ui_binary minui-keyboard || true)"
 
 # Ensure permissions and artwork previews
 ensure_binaries() {
-    # Ensure NextUI .media and .res icon previews exist for SaveSync in Tools/tg5040/
     if [ -f "$PAK_DIR/icon.png" ]; then
         _tools_parent="$(dirname "$PAK_DIR")"
         for _art_dir in "$_tools_parent/.media" "$_tools_parent/.res"; do
@@ -223,7 +222,6 @@ view_debug_logs() {
     _log_view="$(mktemp "${TMPDIR:-/tmp}/savesync_logview.XXXXXX")"
     _dummy_out="$(mktemp "${TMPDIR:-/tmp}/savesync_logout.XXXXXX")"
     if [ -s "$LOG_FILE" ]; then
-        # Show newest log lines at the top so user immediately sees errors
         awk '{lines[NR]=$0} END {for(i=NR;i>=1;i--) print lines[i]}' "$LOG_FILE" > "$_log_view"
     else
         echo "No log entries yet." > "$_log_view"
@@ -244,7 +242,6 @@ run_connection_diagnostics() {
     log "Target: ${SSH_USER}@${SSH_HOST}:${SSH_PORT}"
     log "Local IP(s): $(ip -4 addr show 2>/dev/null | awk '/inet / {print $2}' | tr '\n' ' ' || ifconfig 2>/dev/null | awk '/inet addr/ {print $2}' || echo 'unknown')"
 
-    # 1. Check binaries
     for _b in ssh dbclient dropbearmulti sshpass rsync tar; do
         if command -v "$_b" >/dev/null 2>&1; then
             log "Binary [$_b]: FOUND ($(command -v "$_b"))"
@@ -253,29 +250,21 @@ run_connection_diagnostics() {
         fi
     done
 
-    # 2. Ping test
     if ping -c 1 -W 3 "$SSH_HOST" >/dev/null 2>&1; then
         log "Ping [$SSH_HOST]: OK (Host is reachable on Wi-Fi)"
     else
         log "Ping [$SSH_HOST]: FAILED (Host unreachable! Check Wi-Fi & IP)"
     fi
 
-    # 3. SSH Auth & Key Setup test
     if init_ssh_transport; then
         log "SSH Auth [${SSH_USER}@${SSH_HOST}]: SUCCESS!"
-        _rem_check="$(eval "$SSH_CMD \"${SSH_USER}@${SSH_HOST}\" \"ls -ld '$REMOTE_SAVES_ROOT' 2>&1\"" 2>&1 || true)"
+        _rem_check="$(run_remote_cmd "ls -ld '$REMOTE_SAVES_ROOT' 2>&1" 2>&1 || true)"
         log "Remote Saves Dir: $_rem_check"
         show_ui_message "Diagnostics Passed! Connected to $SSH_HOST" 2
     else
         log "SSH Auth [${SSH_USER}@${SSH_HOST}]: FAILED (See errors above)"
         show_ui_message "Diagnostics Failed! Opening Debug Log..." 2
     fi
-    # 4. Check remote rsync & tar availability
-    if [ -n "$SSH_CMD" ]; then
-        _rem_tools="$(eval "$SSH_CMD \"${SSH_USER}@${SSH_HOST}\" \"command -v rsync || echo 'no-rsync'; command -v tar || echo 'no-tar'\"" 2>/dev/null | tr '\n' ' ' || true)"
-        log "Remote tools on Knulli: $_rem_tools"
-    fi
-
     log "=== END OF DIAGNOSTICS ==="
     view_debug_logs
 }
@@ -476,14 +465,50 @@ get_mtime() {
     fi
 }
 
-# --- SSH / Dropbear / Rsync / Tar-over-SSH Transport Layer ---
-# Supports BOTH OpenSSH (`ssh`) and Dropbear (`dbclient` / `dropbearmulti dbclient`)
-# as well as bundled `sshpass` (with zero dependency on `setsid`).
-SSH_CMD=""
-RSYNC_RSH=""
-REMOTE_HAS_RSYNC="0"
+# Create a BusyBox-compatible tar exclude file (-X) for save states & screenshots
+get_tar_exclude_file() {
+    _ex_file="/tmp/savesync_tar_excludes.txt"
+    cat <<'EOF' > "$_ex_file"
+*.state
+*.state0
+*.state1
+*.state2
+*.state3
+*.state4
+*.state5
+*.state6
+*.state7
+*.state8
+*.state9
+*.state.auto
+*.st0
+*.st1
+*.st2
+*.st3
+*.st4
+*.st5
+*.st6
+*.st7
+*.st8
+*.st9
+*.auto
+*.png
+*.jpg
+*.bmp
+*.txt
+*.xml
+*.cfg
+*.bak
+*.tmp
+EOF
+    echo "$_ex_file"
+}
 
-# Detect whether `ssh` on this device is OpenSSH or Dropbear (or missing -> use bundled dropbearmulti)
+# --- SSH / Dropbear Transport Layer ---
+# Uses a clean wrapper script `/tmp/savesync_ssh_exec.sh` so commands can be run or piped
+# reliably with both OpenSSH (`ssh`) and Dropbear (`dbclient`) without `eval` quoting bugs.
+SSH_EXEC_WRAP="/tmp/savesync_ssh_exec.sh"
+
 get_ssh_flavor() {
     if command -v ssh >/dev/null 2>&1; then
         if ssh -V 2>&1 | grep -qi "Dropbear"; then
@@ -505,30 +530,9 @@ get_ssh_flavor() {
     return 1
 }
 
-# Create a clean RSH wrapper script in /tmp that strips any `-l <user>` argument injected by rsync
-# before forwarding to dbclient/ssh (fixes rsync + dbclient argument ordering bug)
-create_rsh_wrapper() {
-    _inner_cmd="$1"
-    _wrap_path="/tmp/savesync_rsh_wrap.sh"
-    cat <<EOF > "$_wrap_path"
-#!/bin/sh
-export SSHPASS='$SSH_PASSWORD'
-args=""
-while [ "\$#" -gt 0 ]; do
-    case "\$1" in
-        -l)
-            shift 2
-            ;;
-        *)
-            args="\$args \"\$1\""
-            shift
-            ;;
-    esac
-done
-eval "exec $_inner_cmd \$args"
-EOF
-    chmod 700 "$_wrap_path"
-    echo "$_wrap_path"
+# Execute a command on the remote Knulli device
+run_remote_cmd() {
+    "$SSH_EXEC_WRAP" "${SSH_USER}@${SSH_HOST}" "$1"
 }
 
 setup_ssh_keys() {
@@ -537,7 +541,6 @@ setup_ssh_keys() {
     mkdir -p "$_key_dir"
     chmod 700 "$_key_dir" 2>/dev/null || true
 
-    # For Dropbear client, keys must be in Dropbear format; for OpenSSH, OpenSSH format
     if [ "$_flavor" = "openssh" ]; then
         if [ ! -f "$SSH_KEY_PATH" ]; then
             log "Generating new OpenSSH key at $SSH_KEY_PATH..."
@@ -554,7 +557,6 @@ setup_ssh_keys() {
             ssh-keygen -y -f "$SSH_KEY_PATH" > "${SSH_KEY_PATH}.pub" 2>>"$LOG_FILE" || true
         fi
     else
-        # Dropbear key format
         SSH_KEY_PATH="${SSH_KEY_PATH}_dropbear"
         if [ ! -f "$SSH_KEY_PATH" ]; then
             log "Generating new Dropbear SSH key at $SSH_KEY_PATH..."
@@ -613,11 +615,8 @@ init_ssh_transport() {
     _flavor="$(get_ssh_flavor)"
     log "Detected SSH client flavor: $_flavor"
 
-    # Note: If SSH_KEY_PATH is stored on FAT32/exFAT (/mnt/SDCARD), OpenSSH rejects keys with 0777 permissions.
-    # Copy the key into /tmp (tmpfs, supports chmod 600) before passing -i to ssh!
     _runtime_key="/tmp/savesync_id_key"
 
-    # --- Helper to test and activate key auth ---
     try_key_auth() {
         _cand_key="$1"
         [ -f "$_cand_key" ] || return 1
@@ -625,20 +624,22 @@ init_ssh_transport() {
         chmod 600 "$_runtime_key" 2>/dev/null || true
 
         if [ "$_flavor" = "openssh" ]; then
-            _opts="-p $SSH_PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=$SSH_TIMEOUT -i $_runtime_key -o BatchMode=yes -l $SSH_USER"
-            if ssh $_opts "${SSH_HOST}" "echo ok" >>"$LOG_FILE" 2>&1; then
-                _wrap="$(create_rsh_wrapper "ssh $_opts")"
-                SSH_CMD="$_wrap"
-                RSYNC_RSH="$_wrap"
+            cat <<EOF > "$SSH_EXEC_WRAP"
+#!/bin/sh
+exec ssh -p "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout="$SSH_TIMEOUT" -i "$_runtime_key" -o BatchMode=yes "\$@"
+EOF
+            chmod 700 "$SSH_EXEC_WRAP"
+            if run_remote_cmd "echo ok" >>"$LOG_FILE" 2>&1; then
                 log "Connected to ${SSH_HOST} using OpenSSH key auth."
                 return 0
             fi
         elif [ -x "$PAK_DIR/bin/dropbearmulti" ]; then
-            _opts="-p $SSH_PORT -y -y -i $_runtime_key -l $SSH_USER"
-            if "$PAK_DIR/bin/dropbearmulti" dbclient $_opts "${SSH_HOST}" "echo ok" >>"$LOG_FILE" 2>&1; then
-                _wrap="$(create_rsh_wrapper "\"$PAK_DIR/bin/dropbearmulti\" dbclient $_opts")"
-                SSH_CMD="$_wrap"
-                RSYNC_RSH="$_wrap"
+            cat <<EOF > "$SSH_EXEC_WRAP"
+#!/bin/sh
+exec "$PAK_DIR/bin/dropbearmulti" dbclient -p "$SSH_PORT" -y -y -i "$_runtime_key" "\$@"
+EOF
+            chmod 700 "$SSH_EXEC_WRAP"
+            if run_remote_cmd "echo ok" >>"$LOG_FILE" 2>&1; then
                 log "Connected to ${SSH_HOST} using Dropbear key auth."
                 return 0
             fi
@@ -646,50 +647,40 @@ init_ssh_transport() {
         return 1
     }
 
-    # --- Helper to detect if remote Knulli host has rsync installed ---
-    check_remote_capabilities() {
-        REMOTE_HAS_RSYNC="0"
-        if eval "$SSH_CMD \"${SSH_USER}@${SSH_HOST}\" \"command -v rsync >/dev/null 2>&1\"" >>"$LOG_FILE" 2>&1; then
-            REMOTE_HAS_RSYNC="1"
-            log "Remote Knulli host supports rsync."
-        else
-            log "Remote Knulli host does not have rsync; using fast tar-over-SSH streaming."
-        fi
-    }
-
     # 1. Try existing key authentication first
     if try_key_auth "$SSH_KEY_PATH" || try_key_auth "${SSH_KEY_PATH}_dropbear"; then
-        check_remote_capabilities
         return 0
     fi
 
-    # 2. Try direct password authentication via bundled sshpass (Fastest & most reliable on FAT32 SD cards!)
+    # 2. Try direct password authentication via bundled sshpass
     if command -v sshpass >/dev/null 2>&1 && [ -n "$SSH_PASSWORD" ]; then
         export SSHPASS="$SSH_PASSWORD"
         log "Testing sshpass password authentication to ${SSH_USER}@${SSH_HOST}:${SSH_PORT}..."
 
         if [ "$_flavor" = "openssh" ]; then
-            _opts="-p $SSH_PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=$SSH_TIMEOUT -l $SSH_USER"
-            if sshpass -e ssh $_opts "${SSH_HOST}" "echo ok" >>"$LOG_FILE" 2>&1; then
-                _wrap="$(create_rsh_wrapper "\"$(command -v sshpass)\" -e ssh $_opts")"
-                SSH_CMD="$_wrap"
-                RSYNC_RSH="$_wrap"
+            cat <<EOF > "$SSH_EXEC_WRAP"
+#!/bin/sh
+export SSHPASS='$SSH_PASSWORD'
+exec "$(command -v sshpass)" -e ssh -p "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout="$SSH_TIMEOUT" "\$@"
+EOF
+            chmod 700 "$SSH_EXEC_WRAP"
+            if run_remote_cmd "echo ok" >>"$LOG_FILE" 2>&1; then
                 log "Connected to ${SSH_HOST} using sshpass + OpenSSH."
                 setup_ssh_keys >/dev/null 2>&1 || true
-                check_remote_capabilities
                 return 0
             fi
         fi
 
         if [ -x "$PAK_DIR/bin/dropbearmulti" ]; then
-            _opts="-p $SSH_PORT -y -y -l $SSH_USER"
-            if sshpass -e "$PAK_DIR/bin/dropbearmulti" dbclient $_opts "${SSH_HOST}" "echo ok" >>"$LOG_FILE" 2>&1; then
-                _wrap="$(create_rsh_wrapper "\"$(command -v sshpass)\" -e \"$PAK_DIR/bin/dropbearmulti\" dbclient $_opts")"
-                SSH_CMD="$_wrap"
-                RSYNC_RSH="$_wrap"
+            cat <<EOF > "$SSH_EXEC_WRAP"
+#!/bin/sh
+export SSHPASS='$SSH_PASSWORD'
+exec "$(command -v sshpass)" -e "$PAK_DIR/bin/dropbearmulti" dbclient -p "$SSH_PORT" -y -y "\$@"
+EOF
+            chmod 700 "$SSH_EXEC_WRAP"
+            if run_remote_cmd "echo ok" >>"$LOG_FILE" 2>&1; then
                 log "Connected to ${SSH_HOST} using sshpass + bundled dropbearmulti (dbclient)."
                 setup_ssh_keys >/dev/null 2>&1 || true
-                check_remote_capabilities
                 return 0
             fi
         fi
@@ -699,7 +690,6 @@ init_ssh_transport() {
     show_ui_message "Setting up SSH auth with $SSH_HOST..." 0
     if setup_ssh_keys; then
         if try_key_auth "$SSH_KEY_PATH" || try_key_auth "${SSH_KEY_PATH}_dropbear"; then
-            check_remote_capabilities
             return 0
         fi
     fi
@@ -708,83 +698,98 @@ init_ssh_transport() {
     return 1
 }
 
-# --- Remote Pull & Push Helpers (Supports Rsync OR Built-in Tar-over-SSH Fallback) ---
+# --- Remote Pull & Push Helpers ---
+# Uses a single compressed tar stream over SSH between Knulli and TrimUI RAM (/tmp),
+# completely avoiding Dropbear + rsync protocol errors and exFAT ownership/permission failures!
 pull_remote_saves() {
     _remote_folders="$1"
-    _filter_args="$(build_rsync_filter_args)"
-
-    if [ "$REMOTE_HAS_RSYNC" = "1" ] && command -v rsync >/dev/null 2>&1; then
-        log "Using rsync transport to pull remote saves..."
-        _rsync_ok=0
-        for _k_folder in $_remote_folders; do
-            mkdir -p "$REMOTE_STAGE/$_k_folder"
-            # shellcheck disable=SC2086
-            if rsync -rtz --modify-window=2 $_filter_args \
-                -e "$RSYNC_RSH" \
-                "${SSH_USER}@${SSH_HOST}:${REMOTE_SAVES_ROOT}/${_k_folder}/" \
-                "$REMOTE_STAGE/$_k_folder/" >>"$LOG_FILE" 2>&1; then
-                _rsync_ok=1
-            fi
-        done
-        if [ "$_rsync_ok" -eq 1 ]; then
-            return 0
-        fi
-        log "Rsync pull returned non-zero or empty; pulling via single-connection tar-over-SSH..."
-    fi
-
-    log "Using single-connection tar-over-SSH transport to pull saves..."
     for _k_folder in $_remote_folders; do
         mkdir -p "$REMOTE_STAGE/$_k_folder"
     done
-    eval "$SSH_CMD \"${SSH_USER}@${SSH_HOST}\" \"tar -cf - -C '$REMOTE_SAVES_ROOT' --ignore-failed-read --exclude='*.state*' --exclude='*.st[0-9]*' --exclude='*.auto' --exclude='*.png' --exclude='*.jpg' --exclude='*.bmp' --exclude='*.txt' --exclude='*.xml' --exclude='*.cfg' $_remote_folders 2>/dev/null || tar -cf - -C '$REMOTE_SAVES_ROOT' . 2>/dev/null\"" | tar -xf - -p -C "$REMOTE_STAGE" 2>>"$LOG_FILE" || true
+
+    # Use OpenSSH + rsync ONLY when local client is full OpenSSH and rsync is present
+    _flavor="$(get_ssh_flavor)"
+    if [ "$_flavor" = "openssh" ] && command -v rsync >/dev/null 2>&1; then
+        if run_remote_cmd "command -v rsync >/dev/null 2>&1" >>"$LOG_FILE" 2>&1; then
+            log "Using OpenSSH + rsync transport to pull remote saves..."
+            _filter_args="$(build_rsync_filter_args)"
+            for _k_folder in $_remote_folders; do
+                # shellcheck disable=SC2086
+                rsync -rtz --no-perms --no-owner --no-group --modify-window=2 $_filter_args \
+                    -e "$SSH_EXEC_WRAP" \
+                    "${SSH_USER}@${SSH_HOST}:${REMOTE_SAVES_ROOT}/${_k_folder}/" \
+                    "$REMOTE_STAGE/$_k_folder/" >>"$LOG_FILE" 2>&1 || true
+            done
+            return 0
+        fi
+    fi
+
+    log "Streaming remote saves from Knulli via single-connection tar-over-SSH..."
+    _tmp_pull_tar="$STAGE_DIR/remote_pull.tar.gz"
+
+    # Build a clean list of existing mapped subdirectories on Knulli and archive them to stdout
+    _remote_script="cd '$REMOTE_SAVES_ROOT' 2>/dev/null || exit 0; list=''; for d in $_remote_folders; do [ -d \"\$d\" ] && list=\"\$list \$d\"; done; [ -n \"\$list\" ] && tar -czf - \$list 2>/dev/null || true"
+
+    run_remote_cmd "$_remote_script" > "$_tmp_pull_tar" 2>>"$LOG_FILE" || true
+
+    if [ -s "$_tmp_pull_tar" ]; then
+        tar -xzf "$_tmp_pull_tar" -C "$REMOTE_STAGE" 2>>"$LOG_FILE" || true
+        log "Successfully unpacked remote saves into staging."
+    else
+        log "Remote saves archive was empty (no existing saves found on Knulli yet)."
+    fi
+    rm -f "$_tmp_pull_tar"
 }
 
 push_remote_saves() {
     _remote_folders="$1"
-    _filter_args="$(build_rsync_filter_args)"
 
-    if [ "$REMOTE_HAS_RSYNC" = "1" ] && command -v rsync >/dev/null 2>&1; then
-        log "Using rsync transport to push updated saves..."
-        _push_failed=0
-        for _k_folder in $_remote_folders; do
-            if [ -d "$REMOTE_STAGE/$_k_folder" ] && [ -n "$(ls -A "$REMOTE_STAGE/$_k_folder" 2>/dev/null)" ]; then
-                # Create target directory on remote first so rsync never fails on missing parent dir
-                eval "$SSH_CMD \"${SSH_USER}@${SSH_HOST}\" \"mkdir -p '${REMOTE_SAVES_ROOT}/${_k_folder}'\"" >>"$LOG_FILE" 2>&1 || true
-                # shellcheck disable=SC2086
-                if ! rsync -rtz --modify-window=2 -u $_filter_args \
-                    -e "$RSYNC_RSH" \
-                    "$REMOTE_STAGE/$_k_folder/" \
-                    "${SSH_USER}@${SSH_HOST}:${REMOTE_SAVES_ROOT}/${_k_folder}/" >>"$LOG_FILE" 2>&1; then
-                    _push_failed=1
-                    break
+    _flavor="$(get_ssh_flavor)"
+    if [ "$_flavor" = "openssh" ] && command -v rsync >/dev/null 2>&1; then
+        if run_remote_cmd "command -v rsync >/dev/null 2>&1" >>"$LOG_FILE" 2>&1; then
+            log "Using OpenSSH + rsync transport to push updated saves..."
+            _filter_args="$(build_rsync_filter_args)"
+            for _k_folder in $_remote_folders; do
+                if [ -d "$REMOTE_STAGE/$_k_folder" ] && [ -n "$(ls -A "$REMOTE_STAGE/$_k_folder" 2>/dev/null)" ]; then
+                    run_remote_cmd "mkdir -p '${REMOTE_SAVES_ROOT}/${_k_folder}'" >>"$LOG_FILE" 2>&1 || true
+                    # shellcheck disable=SC2086
+                    rsync -rtz --no-perms --no-owner --no-group --modify-window=2 -u $_filter_args \
+                        -e "$SSH_EXEC_WRAP" \
+                        "$REMOTE_STAGE/$_k_folder/" \
+                        "${SSH_USER}@${SSH_HOST}:${REMOTE_SAVES_ROOT}/${_k_folder}/" >>"$LOG_FILE" 2>&1
                 fi
-            fi
-        done
-        if [ "$_push_failed" -eq 0 ]; then
+            done
             return 0
         fi
-        log "Rsync push interrupted; falling back to single-connection tar-over-SSH push..."
     fi
 
-    log "Using single-connection tar-over-SSH transport to push saves..."
+    log "Uploading updated saves to Knulli via single-connection tar-over-SSH..."
     _dirs_to_push=""
     for _k_folder in $_remote_folders; do
         if [ -d "$REMOTE_STAGE/$_k_folder" ] && [ -n "$(ls -A "$REMOTE_STAGE/$_k_folder" 2>/dev/null)" ]; then
             _dirs_to_push="$_dirs_to_push $_k_folder"
         fi
     done
+
     if [ -n "$_dirs_to_push" ]; then
+        _tmp_push_tar="$STAGE_DIR/remote_push.tar.gz"
+        # BusyBox tar compatible: `tar -czf <file> -C <dir> <folders>`
         # shellcheck disable=SC2086
-        if ! (tar -cf - -C "$REMOTE_STAGE" $_dirs_to_push 2>>"$LOG_FILE" | \
-            eval "$SSH_CMD \"${SSH_USER}@${SSH_HOST}\" \"mkdir -p '$REMOTE_SAVES_ROOT' && tar -xf - -p -C '$REMOTE_SAVES_ROOT'\"" >>"$LOG_FILE" 2>&1); then
-            log "ERROR: Failed to push saves via tar-over-SSH."
-            return 1
+        tar -czf "$_tmp_push_tar" -C "$REMOTE_STAGE" $_dirs_to_push 2>>"$LOG_FILE"
+        if [ -s "$_tmp_push_tar" ]; then
+            if ! run_remote_cmd "mkdir -p '$REMOTE_SAVES_ROOT' && tar -xzf - -C '$REMOTE_SAVES_ROOT'" < "$_tmp_push_tar" >>"$LOG_FILE" 2>&1; then
+                rm -f "$_tmp_push_tar"
+                log "ERROR: Failed to unpack pushed saves on Knulli."
+                return 1
+            fi
         fi
+        rm -f "$_tmp_push_tar"
     fi
     return 0
 }
 
 # --- Backup & Rotation Functions (Keep Last N Compressed Backups) ---
+# Compatible with BusyBox v1.27.2 tar (uses `-X <exclude_file>` instead of GNU `--exclude=`)
 rotate_backups() {
     _prefix="$1"
     _keep="$BACKUP_KEEP_COUNT"
@@ -804,28 +809,23 @@ create_backups() {
     _remote_stage_raw="$2"
 
     mkdir -p "$BACKUP_DIR"
+    _ex_file="$(get_tar_exclude_file)"
 
-    if [ -d "$LOCAL_SAVES_ROOT" ]; then
+    # 1. Local NextUI Saves Backup
+    if [ -d "$LOCAL_SAVES_ROOT" ] && [ -n "$(ls -A "$LOCAL_SAVES_ROOT" 2>/dev/null)" ]; then
         _local_archive="$BACKUP_DIR/local_${_run_ts}.tar.gz"
         log "Creating compressed local backup: $_local_archive"
-        tar -czf "$_local_archive" \
-            --exclude="*.state*" \
-            --exclude="*.st[0-9]*" \
-            --exclude="*.auto" \
-            --exclude="*.png" \
-            -C "$LOCAL_SAVES_ROOT" . >>"$LOG_FILE" 2>&1 || true
+        tar -czf "$_local_archive" -X "$_ex_file" -C "$LOCAL_SAVES_ROOT" . >>"$LOG_FILE" 2>&1 || \
+        tar -czf "$_local_archive" -C "$LOCAL_SAVES_ROOT" . >>"$LOG_FILE" 2>&1 || true
         rotate_backups "local"
     fi
 
-    if [ "$BACKUP_REMOTE" = "true" ] && [ -d "$_remote_stage_raw" ]; then
+    # 2. Remote Knulli Saves Backup (from downloaded staging snapshot)
+    if [ "$BACKUP_REMOTE" = "true" ] && [ -d "$_remote_stage_raw" ] && [ -n "$(ls -A "$_remote_stage_raw" 2>/dev/null)" ]; then
         _remote_archive="$BACKUP_DIR/remote_${_run_ts}.tar.gz"
         log "Creating compressed remote backup: $_remote_archive"
-        tar -czf "$_remote_archive" \
-            --exclude="*.state*" \
-            --exclude="*.st[0-9]*" \
-            --exclude="*.auto" \
-            --exclude="*.png" \
-            -C "$_remote_stage_raw" . >>"$LOG_FILE" 2>&1 || true
+        tar -czf "$_remote_archive" -X "$_ex_file" -C "$_remote_stage_raw" . >>"$LOG_FILE" 2>&1 || \
+        tar -czf "$_remote_archive" -C "$_remote_stage_raw" . >>"$LOG_FILE" 2>&1 || true
         rotate_backups "remote"
     fi
 }
@@ -834,6 +834,16 @@ create_backups() {
 build_rsync_filter_args() {
     _args="--exclude=*.state --exclude=*.state* --exclude=*.st[0-9]* --exclude=*.auto --exclude=*.png --exclude=*.jpg --exclude=*.bmp --exclude=*.txt --exclude=*.xml --exclude=*.cfg --exclude=.*"
     echo "$_args"
+}
+
+# Copy file preserving modification timestamp safely on exFAT/FAT32 SD cards
+# (Avoids `cp -p` failing or warning when trying to chown/chmod on exFAT)
+copy_save_with_mtime() {
+    _src="$1"
+    _dst="$2"
+    mkdir -p "$(dirname "$_dst")"
+    cp -f "$_src" "$_dst"
+    touch -r "$_src" "$_dst" 2>/dev/null || true
 }
 
 sync_file_pair() {
@@ -853,8 +863,7 @@ sync_file_pair() {
     if [ "$_loc_exists" -eq 1 ] && [ "$_rem_exists" -eq 0 ]; then
         log "[PUSH NEW] $_label: NextUI -> Knulli ($(basename "$_loc_file") -> $(basename "$_rem_file"))"
         if [ "$DRY_RUN" != "true" ]; then
-            mkdir -p "$(dirname "$_rem_file")"
-            cp -p "$_loc_file" "$_rem_file"
+            copy_save_with_mtime "$_loc_file" "$_rem_file"
         fi
         PUSH_COUNT=$((PUSH_COUNT + 1))
         return 0
@@ -863,8 +872,7 @@ sync_file_pair() {
     if [ "$_loc_exists" -eq 0 ] && [ "$_rem_exists" -eq 1 ]; then
         log "[PULL NEW] $_label: Knulli -> NextUI ($(basename "$_rem_file") -> $(basename "$_loc_file"))"
         if [ "$DRY_RUN" != "true" ]; then
-            mkdir -p "$(dirname "$_loc_file")"
-            cp -p "$_rem_file" "$_loc_file"
+            copy_save_with_mtime "$_rem_file" "$_loc_file"
         fi
         PULL_COUNT=$((PULL_COUNT + 1))
         return 0
@@ -881,13 +889,13 @@ sync_file_pair() {
     if [ "$_diff" -gt 2 ]; then
         log "[PUSH UPDATE] $_label: NextUI is newer ($_loc_mtime > $_rem_mtime) -> updating Knulli ($(basename "$_rem_file"))"
         if [ "$DRY_RUN" != "true" ]; then
-            cp -p "$_loc_file" "$_rem_file"
+            copy_save_with_mtime "$_loc_file" "$_rem_file"
         fi
         PUSH_COUNT=$((PUSH_COUNT + 1))
     elif [ "$_diff" -lt -2 ]; then
         log "[PULL UPDATE] $_label: Knulli is newer ($_rem_mtime > $_loc_mtime) -> updating NextUI ($(basename "$_loc_file"))"
         if [ "$DRY_RUN" != "true" ]; then
-            cp -p "$_rem_file" "$_loc_file"
+            copy_save_with_mtime "$_rem_file" "$_loc_file"
         fi
         PULL_COUNT=$((PULL_COUNT + 1))
     else
@@ -936,7 +944,7 @@ run_sync() {
     show_ui_message "Fetching saves from Knulli ($SSH_HOST)..." 0
     log "Pulling remote saves from ${SSH_USER}@${SSH_HOST}:${REMOTE_SAVES_ROOT} into staging..."
 
-    eval "$SSH_CMD \"${SSH_USER}@${SSH_HOST}\" \"mkdir -p '$REMOTE_SAVES_ROOT'\"" >>"$LOG_FILE" 2>&1 || true
+    run_remote_cmd "mkdir -p '$REMOTE_SAVES_ROOT'" >>"$LOG_FILE" 2>&1 || true
 
     pull_remote_saves "$_remote_folders"
 
