@@ -7,7 +7,7 @@
 set -u
 
 PAK_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-export PATH="$PAK_DIR/bin:$PATH"
+export PATH="$PAK_DIR/bin:$PATH:/usr/TrimUI/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 # --- Default Environment Fallbacks ---
 SDCARD_PATH="${SDCARD_PATH:-/mnt/SDCARD}"
@@ -50,7 +50,6 @@ load_config
 save_config_value() {
     _key="$1"
     _val="$2"
-    # Escape backslashes and double quotes for safe shell sourcing
     _escaped="$(printf '%s' "$_val" | sed 's/\\/\\\\/g; s/"/\\"/g')"
     _tmp_cfg="${CONFIG_FILE}.tmp"
 
@@ -115,35 +114,54 @@ PRESENTER_BIN="$(find_ui_binary minui-presenter || true)"
 LIST_BIN="$(find_ui_binary minui-list || true)"
 KEYBOARD_BIN="$(find_ui_binary minui-keyboard || true)"
 
-# Auto-fetch UI helper binaries on first launch if missing and internet is reachable
-ensure_ui_binaries() {
-    if [ -n "$LIST_BIN" ] && [ -n "$KEYBOARD_BIN" ]; then
+# Auto-fetch UI helper binaries and static rsync on first launch if missing and internet is reachable
+ensure_binaries() {
+    mkdir -p "$PAK_DIR/bin"
+    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
         return 0
     fi
-    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
-        return 1
-    fi
-    mkdir -p "$PAK_DIR/bin"
-    for _pair in "josegonzalez/minui-list:minui-list" "josegonzalez/minui-keyboard:minui-keyboard" "josegonzalez/minui-presenter:minui-presenter"; do
-        _repo="${_pair%%:*}"
-        _name="${_pair##*:}"
-        _dest="$PAK_DIR/bin/$_name"
-        [ -x "$_dest" ] && continue
-        _url="https://github.com/${_repo}/releases/latest/download/${_name}-${PLATFORM}-nextui"
+
+    # 1. Fetch static aarch64 rsync if rsync is not installed on TrimUI
+    if ! command -v rsync >/dev/null 2>&1; then
+        _rsync_dest="$PAK_DIR/bin/rsync"
+        _rsync_url="https://raw.githubusercontent.com/ryanwoodsmall/static-binaries/master/aarch64/rsync"
+        log "Attempting to auto-download static aarch64 rsync binary..."
         if command -v curl >/dev/null 2>&1; then
-            curl -fsSL -L --connect-timeout 4 "$_url" -o "$_dest" 2>/dev/null || true
+            curl -fsSL -L --connect-timeout 5 "$_rsync_url" -o "$_rsync_dest" 2>/dev/null || true
         elif command -v wget >/dev/null 2>&1; then
-            wget -q -T 4 -O "$_dest" "$_url" 2>/dev/null || true
+            wget -q -T 5 -O "$_rsync_dest" "$_rsync_url" 2>/dev/null || true
         fi
-        if [ -s "$_dest" ]; then
-            chmod +x "$_dest"
+        if [ -s "$_rsync_dest" ]; then
+            chmod +x "$_rsync_dest"
+            log "Installed static rsync binary to $_rsync_dest"
         else
-            rm -f "$_dest"
+            rm -f "$_rsync_dest"
         fi
-    done
-    PRESENTER_BIN="$(find_ui_binary minui-presenter || true)"
-    LIST_BIN="$(find_ui_binary minui-list || true)"
-    KEYBOARD_BIN="$(find_ui_binary minui-keyboard || true)"
+    fi
+
+    # 2. Fetch NextUI UI binaries if missing
+    if [ -z "$LIST_BIN" ] || [ -z "$KEYBOARD_BIN" ]; then
+        for _pair in "josegonzalez/minui-list:minui-list" "josegonzalez/minui-keyboard:minui-keyboard" "josegonzalez/minui-presenter:minui-presenter"; do
+            _repo="${_pair%%:*}"
+            _name="${_pair##*:}"
+            _dest="$PAK_DIR/bin/$_name"
+            [ -x "$_dest" ] && continue
+            _url="https://github.com/${_repo}/releases/latest/download/${_name}-${PLATFORM}-nextui"
+            if command -v curl >/dev/null 2>&1; then
+                curl -fsSL -L --connect-timeout 4 "$_url" -o "$_dest" 2>/dev/null || true
+            elif command -v wget >/dev/null 2>&1; then
+                wget -q -T 4 -O "$_dest" "$_url" 2>/dev/null || true
+            fi
+            if [ -s "$_dest" ]; then
+                chmod +x "$_dest"
+            else
+                rm -f "$_dest"
+            fi
+        done
+        PRESENTER_BIN="$(find_ui_binary minui-presenter || true)"
+        LIST_BIN="$(find_ui_binary minui-list || true)"
+        KEYBOARD_BIN="$(find_ui_binary minui-keyboard || true)"
+    fi
 }
 
 # --- On-Screen Display Helper ---
@@ -187,8 +205,6 @@ cleanup_ui() {
 trap cleanup_ui EXIT INT TERM
 
 # --- Interactive On-Screen Keyboard & Menu UI ---
-# Prompt user for text input via minui-keyboard (or terminal fallback)
-# Usage: prompt_keyboard "Title" "initial_value"
 prompt_keyboard() {
     _title="$1"
     _init_val="$2"
@@ -205,7 +221,6 @@ prompt_keyboard() {
         rm -f "$_out_file"
         return 1
     elif [ -t 0 ]; then
-        # Interactive terminal fallback when testing on PC/SSH
         printf "%s [%s]: " "$_title" "$_init_val" >&2
         IFS= read -r _res
         rm -f "$_out_file"
@@ -220,7 +235,6 @@ prompt_keyboard() {
     return 1
 }
 
-# Mask password for display in menu (e.g., "linux" -> "***** (set)")
 mask_password() {
     _pw="$1"
     if [ -z "$_pw" ]; then
@@ -230,9 +244,8 @@ mask_password() {
     fi
 }
 
-# Run the interactive SaveSync Menu using minui-list
 run_interactive_menu() {
-    ensure_ui_binaries
+    ensure_binaries
 
     if [ -z "$LIST_BIN" ]; then
         log "minui-list binary not found; falling back to direct sync."
@@ -271,7 +284,6 @@ EOF
         _selection="$(cat "$_choice_file" 2>/dev/null | head -n 1 | tr -d '\r\n')"
         rm -f "$_menu_file" "$_choice_file"
 
-        # Exit code 2 (B button) or 3 (MENU button) or empty selection exits menu
         if [ "$_rc" -ne 0 ] || [ -z "$_selection" ] || [ "$_selection" = "Exit" ]; then
             log "Exiting SaveSync UI menu."
             break
@@ -346,7 +358,6 @@ trim() {
     echo "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
 }
 
-# Returns 0 if filename is a save state or non-save metadata, 1 otherwise
 is_save_state_or_ignored() {
     _fname="$1"
     case "$_fname" in
@@ -357,7 +368,6 @@ is_save_state_or_ignored() {
     return 1
 }
 
-# Returns 0 if file has an allowed in-game save extension, 1 otherwise
 is_allowed_save_file() {
     _fname="$1"
     if is_save_state_or_ignored "$_fname"; then
@@ -373,7 +383,6 @@ is_allowed_save_file() {
     return 1
 }
 
-# Get modification timestamp in epoch seconds
 get_mtime() {
     _file="$1"
     if [ ! -e "$_file" ]; then
@@ -389,7 +398,7 @@ get_mtime() {
     fi
 }
 
-# --- SSH / Rsync Transport Layer ---
+# --- SSH / Rsync / Tar-over-SSH Transport Layer ---
 SSH_CMD=""
 RSYNC_RSH=""
 
@@ -523,6 +532,64 @@ EOF
     return 1
 }
 
+# --- Remote Pull & Push Helpers (Supports Rsync OR Built-in Tar-over-SSH Fallback) ---
+# Pulls mapped system folders from Knulli into $REMOTE_STAGE
+pull_remote_saves() {
+    _remote_folders="$1"
+    _filter_args="$(build_rsync_filter_args)"
+
+    if command -v rsync >/dev/null 2>&1; then
+        log "Using rsync transport to pull remote saves..."
+        for _k_folder in $_remote_folders; do
+            mkdir -p "$REMOTE_STAGE/$_k_folder"
+            # shellcheck disable=SC2086
+            rsync -rtz --modify-window=2 $_filter_args \
+                -e "$RSYNC_RSH" \
+                "${SSH_USER}@${SSH_HOST}:${REMOTE_SAVES_ROOT}/${_k_folder}/" \
+                "$REMOTE_STAGE/$_k_folder/" >>"$LOG_FILE" 2>&1 || true
+        done
+    else
+        log "rsync binary not present locally; using native tar-over-SSH transport to pull saves..."
+        # Create folder directories locally and stream existing remote folders via tar over SSH
+        for _k_folder in $_remote_folders; do
+            mkdir -p "$REMOTE_STAGE/$_k_folder"
+        done
+        eval "$SSH_CMD \"${SSH_USER}@${SSH_HOST}\" \"tar -cf - -C '$REMOTE_SAVES_ROOT' --ignore-failed-read --exclude='*.state*' --exclude='*.st[0-9]*' --exclude='*.auto' --exclude='*.png' --exclude='*.jpg' --exclude='*.bmp' --exclude='*.txt' --exclude='*.xml' --exclude='*.cfg' $_remote_folders 2>/dev/null || tar -cf - -C '$REMOTE_SAVES_ROOT' . 2>/dev/null\"" | tar -xf - -p -C "$REMOTE_STAGE" 2>>"$LOG_FILE" || true
+    fi
+}
+
+# Pushes updated saves in $REMOTE_STAGE back to Knulli
+push_remote_saves() {
+    _remote_folders="$1"
+    _filter_args="$(build_rsync_filter_args)"
+
+    if command -v rsync >/dev/null 2>&1; then
+        log "Using rsync transport to push updated saves..."
+        for _k_folder in $_remote_folders; do
+            if [ -d "$REMOTE_STAGE/$_k_folder" ] && [ -n "$(ls -A "$REMOTE_STAGE/$_k_folder" 2>/dev/null)" ]; then
+                # shellcheck disable=SC2086
+                rsync -rtz --modify-window=2 -u $_filter_args \
+                    -e "$RSYNC_RSH" \
+                    "$REMOTE_STAGE/$_k_folder/" \
+                    "${SSH_USER}@${SSH_HOST}:${REMOTE_SAVES_ROOT}/${_k_folder}/" >>"$LOG_FILE" 2>&1
+            fi
+        done
+    else
+        log "rsync binary not present locally; using native tar-over-SSH transport to push saves..."
+        _dirs_to_push=""
+        for _k_folder in $_remote_folders; do
+            if [ -d "$REMOTE_STAGE/$_k_folder" ] && [ -n "$(ls -A "$REMOTE_STAGE/$_k_folder" 2>/dev/null)" ]; then
+                _dirs_to_push="$_dirs_to_push $_k_folder"
+            fi
+        done
+        if [ -n "$_dirs_to_push" ]; then
+            # shellcheck disable=SC2086
+            tar -cf - -C "$REMOTE_STAGE" $_dirs_to_push 2>>"$LOG_FILE" | \
+                eval "$SSH_CMD \"${SSH_USER}@${SSH_HOST}\" \"mkdir -p '$REMOTE_SAVES_ROOT' && tar -xf - -p -C '$REMOTE_SAVES_ROOT'\"" >>"$LOG_FILE" 2>&1
+        fi
+    fi
+}
+
 # --- Backup & Rotation Functions (Keep Last N Compressed Backups) ---
 rotate_backups() {
     _prefix="$1"
@@ -569,7 +636,7 @@ create_backups() {
     fi
 }
 
-# --- Core Mapping & Bidirectional Rsync Engine ---
+# --- Core Mapping & Bidirectional Sync Engine ---
 build_rsync_filter_args() {
     _args="--exclude=*.state --exclude=*.state* --exclude=*.st[0-9]* --exclude=*.auto --exclude=*.png --exclude=*.jpg --exclude=*.bmp --exclude=*.txt --exclude=*.xml --exclude=*.cfg --exclude=.*"
     echo "$_args"
@@ -637,12 +704,7 @@ sync_file_pair() {
 run_sync() {
     _action="${1:-sync}"
     load_config
-
-    if ! command -v rsync >/dev/null 2>&1; then
-        show_ui_message "Error: rsync binary not found!" 4
-        log "ERROR: rsync not found in PATH ($PATH)"
-        return 1
-    fi
+    ensure_binaries
 
     show_ui_message "Connecting to $SSH_HOST..." 0
     if ! init_ssh_transport; then
@@ -682,15 +744,7 @@ run_sync() {
 
     eval "$SSH_CMD \"${SSH_USER}@${SSH_HOST}\" \"mkdir -p '$REMOTE_SAVES_ROOT'\"" >>"$LOG_FILE" 2>&1 || true
 
-    _filter_args="$(build_rsync_filter_args)"
-    for _k_folder in $_remote_folders; do
-        mkdir -p "$REMOTE_STAGE/$_k_folder"
-        # shellcheck disable=SC2086
-        rsync -rtz --modify-window=2 $_filter_args \
-            -e "$RSYNC_RSH" \
-            "${SSH_USER}@${SSH_HOST}:${REMOTE_SAVES_ROOT}/${_k_folder}/" \
-            "$REMOTE_STAGE/$_k_folder/" >>"$LOG_FILE" 2>&1 || true
-    done
+    pull_remote_saves "$_remote_folders"
 
     find "$REMOTE_STAGE" -type f | while IFS= read -r _rf; do
         if ! is_allowed_save_file "$(basename "$_rf")"; then
@@ -798,15 +852,7 @@ run_sync() {
     if [ "$DRY_RUN" != "true" ] && [ "$PUSH_COUNT" -gt 0 ]; then
         show_ui_message "Uploading $PUSH_COUNT save(s) to Knulli..." 0
         log "Pushing $PUSH_COUNT updated save(s) to ${SSH_USER}@${SSH_HOST}:${REMOTE_SAVES_ROOT}..."
-        for _k_folder in $_remote_folders; do
-            if [ -d "$REMOTE_STAGE/$_k_folder" ] && [ -n "$(ls -A "$REMOTE_STAGE/$_k_folder" 2>/dev/null)" ]; then
-                # shellcheck disable=SC2086
-                rsync -rtz --modify-window=2 -u $_filter_args \
-                    -e "$RSYNC_RSH" \
-                    "$REMOTE_STAGE/$_k_folder/" \
-                    "${SSH_USER}@${SSH_HOST}:${REMOTE_SAVES_ROOT}/${_k_folder}/" >>"$LOG_FILE" 2>&1
-            fi
-        done
+        push_remote_saves "$_remote_folders"
     fi
 
     rm -rf "$STAGE_DIR"
@@ -886,7 +932,6 @@ case "$EFFECTIVE_MODE" in
         ;;
     sync|auto|*)
         if ! run_sync "sync"; then
-            # If auto-sync fails to connect and UI is available, offer the settings menu
             if [ -n "$LIST_BIN" ]; then
                 run_interactive_menu
             else

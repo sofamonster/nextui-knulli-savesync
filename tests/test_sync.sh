@@ -12,6 +12,7 @@
 #   6. Save state exclusion (.state, .state.auto, .st0, .png)
 #   7. Bidirectional newest-wins conflict resolution
 #   8. Rolling 3-run compressed backup rotation (local + remote)
+#   9. Native tar-over-SSH fallback when rsync binary is missing on TrimUI
 # ==============================================================================
 
 set -eu
@@ -34,6 +35,7 @@ MOCK_BIN="$TEST_SANDBOX/mock_bin"
 mkdir -p "$SDCARD_MOCK/Tools/tg5040"
 cp -r "$PAK_SRC" "$SDCARD_MOCK/Tools/tg5040/SaveSync.pak"
 TEST_PAK="$SDCARD_MOCK/Tools/tg5040/SaveSync.pak"
+rm -f "$TEST_PAK/bin/rsync" "$TEST_PAK/bin/minui-list" "$TEST_PAK/bin/minui-keyboard" "$TEST_PAK/bin/minui-presenter"
 
 mkdir -p "$SDCARD_MOCK/Saves/GBA" \
          "$SDCARD_MOCK/Saves/SFC" \
@@ -48,7 +50,6 @@ echo "0" > "$UI_STEP_FILE"
 
 cat <<EOF > "$MOCK_BIN/minui-list"
 #!/bin/sh
-# Parse --write-location
 write_loc=""
 while [ "\$#" -gt 0 ]; do
     if [ "\$1" = "--write-location" ]; then
@@ -94,19 +95,25 @@ exit 0
 EOF
 chmod +x "$MOCK_BIN/minui-keyboard"
 
+# Stub curl/wget in test sandbox so ensure_binaries doesn't try network calls
+cat <<EOF > "$MOCK_BIN/curl"
+#!/bin/sh
+exit 1
+EOF
+chmod +x "$MOCK_BIN/curl"
+cp "$MOCK_BIN/curl" "$MOCK_BIN/wget"
+
 echo "=== Testing Interactive On-Device UI (IP, Username, Password Entry) ==="
 PATH="$MOCK_BIN:$PATH" SDCARD_PATH="$SDCARD_MOCK" "$TEST_PAK/launch.sh" --menu
 
-# Verify config.cfg was updated by the UI
 grep -q '^SSH_HOST="192.168.1.88"$' "$TEST_PAK/config.cfg" && echo "[PASS] UI updated SSH_HOST to 192.168.1.88"
 grep -q '^SSH_USER="knulliuser"$' "$TEST_PAK/config.cfg" && echo "[PASS] UI updated SSH_USER to knulliuser"
 grep -q '^SSH_PASSWORD="secretpass123"$' "$TEST_PAK/config.cfg" && echo "[PASS] UI updated SSH_PASSWORD to secretpass123"
 
-# Reset SSH_HOST/SSH_USER for the rsync mock test
 sed -i 's/^SSH_HOST=.*/SSH_HOST="KNULLI.local"/' "$TEST_PAK/config.cfg"
 sed -i 's/^SSH_USER=.*/SSH_USER="root"/' "$TEST_PAK/config.cfg"
 
-# Create mock ssh and rsync that operate locally against $TEST_SANDBOX/knulli_remote
+# Create mock ssh that also executes remote commands locally (replacing /userdata/saves with $REMOTE_MOCK)
 cat <<EOF > "$MOCK_BIN/ssh"
 #!/bin/sh
 for last_arg in "\$@"; do :; done
@@ -115,11 +122,12 @@ case "\$last_arg" in
         echo "ok"
         exit 0
         ;;
-    mkdir*)
-        exit 0
+    *)
+        rewritten_cmd="\$(echo "\$last_arg" | sed "s|/userdata/saves|$REMOTE_MOCK|g")"
+        eval "\$rewritten_cmd"
+        exit \$?
         ;;
 esac
-exit 0
 EOF
 chmod +x "$MOCK_BIN/ssh"
 
@@ -144,12 +152,10 @@ eval "$REAL_RSYNC \$args"
 EOF
 chmod +x "$MOCK_BIN/rsync"
 
-# Create dummy SSH key so init_ssh_transport succeeds immediately
 mkdir -p "$TEST_PAK/.ssh"
 touch "$TEST_PAK/.ssh/id_save_sync" "$TEST_PAK/.ssh/id_save_sync.pub"
 chmod 600 "$TEST_PAK/.ssh/id_save_sync"
 
-# Add a per-game override rule in game_overrides.cfg
 cat <<EOF >> "$TEST_PAK/game_overrides.cfg"
 GBA | gba | Pokemon - Emerald Version (USA).gba.sav | Pokemon Emerald (U).srm
 EOF
@@ -177,7 +183,7 @@ echo "state_auto" > "$REMOTE_MOCK/gba/Metroid Fusion.state.auto"
 echo "screenshot" > "$REMOTE_MOCK/gba/Metroid Fusion.png"
 echo "local_state" > "$SDCARD_MOCK/Saves/GBA/Metroid Fusion.st0"
 
-echo "=== Running SaveSync (Run #1) ==="
+echo "=== Running SaveSync (Run #1 - with rsync) ==="
 PATH="$MOCK_BIN:$PATH" SDCARD_PATH="$SDCARD_MOCK" "$TEST_PAK/launch.sh" --sync
 
 assert_file_content() {
@@ -214,10 +220,38 @@ assert_file_missing "$SDCARD_MOCK/Saves/GBA/Metroid Fusion.state.auto"
 assert_file_missing "$SDCARD_MOCK/Saves/GBA/Metroid Fusion.png"
 assert_file_missing "$REMOTE_MOCK/gba/Metroid Fusion.st0"
 
+# --- Test Fallback When rsync Binary is Missing ---
+echo "=== Testing Native Tar-over-SSH Fallback (when rsync binary is missing) ==="
+rm -f "$MOCK_BIN/rsync"
+# Create a restricted bin directory without rsync
+NO_RSYNC_BIN="$TEST_SANDBOX/no_rsync_bin"
+mkdir -p "$NO_RSYNC_BIN"
+for tool in sh basename dirname cat cp rm mkdir mktemp date stat cmp grep sed awk tr head ls find tar tee chmod sync sleep touch wc; do
+    if command -v "$tool" >/dev/null 2>&1; then
+        ln -sf "$(command -v "$tool")" "$NO_RSYNC_BIN/$tool"
+    fi
+done
+ln -sf "$MOCK_BIN/ssh" "$NO_RSYNC_BIN/ssh"
+ln -sf "$MOCK_BIN/curl" "$NO_RSYNC_BIN/curl"
+ln -sf "$MOCK_BIN/wget" "$NO_RSYNC_BIN/wget"
+
+# Update launch.sh PATH inside test pak so it doesn't find host /usr/bin/rsync
+sed -i "s|export PATH=.*|export PATH=\"\$PAK_DIR/bin:$NO_RSYNC_BIN\"|" "$TEST_PAK/launch.sh"
+
+echo "castlevania_local_v1" > "$SDCARD_MOCK/Saves/GBA/Castlevania Aria.gba.sav"
+touch -d "2026-11-14 15:00:00" "$SDCARD_MOCK/Saves/GBA/Castlevania Aria.gba.sav"
+echo "ff6_remote_v1" > "$REMOTE_MOCK/snes/Final Fantasy III.srm"
+touch -d "2026-11-14 15:30:00" "$REMOTE_MOCK/snes/Final Fantasy III.srm"
+
+PATH="$NO_RSYNC_BIN" SDCARD_PATH="$SDCARD_MOCK" "$TEST_PAK/launch.sh" --sync
+
+assert_file_content "$REMOTE_MOCK/gba/Castlevania Aria.srm" "castlevania_local_v1"
+assert_file_content "$SDCARD_MOCK/Saves/SFC/Final Fantasy III.sfc.sav" "ff6_remote_v1"
+
 echo "=== Testing Rolling 3-Run Backup Rotation ==="
-for i in 2 3 4; do
+for i in 3 4; do
     sleep 1
-    PATH="$MOCK_BIN:$PATH" SDCARD_PATH="$SDCARD_MOCK" "$TEST_PAK/launch.sh" --sync >/dev/null
+    PATH="$NO_RSYNC_BIN" SDCARD_PATH="$SDCARD_MOCK" "$TEST_PAK/launch.sh" --sync >/dev/null
 done
 
 LOCAL_BACKUP_COUNT="$(ls -1 "$SDCARD_MOCK/Backups/SaveSync/local_"*.tar.gz 2>/dev/null | wc -l)"
