@@ -282,9 +282,9 @@ reset_and_reinstall_ssh_keys() {
     if command -v sshpass >/dev/null 2>&1 && [ -n "$SSH_PASSWORD" ]; then
         export SSHPASS="$SSH_PASSWORD"
         if [ -x "$PAK_DIR/bin/dropbearmulti" ]; then
-            sshpass -e "$PAK_DIR/bin/dropbearmulti" dbclient -p "$SSH_PORT" -y -y "${SSH_USER}@${SSH_HOST}" "$_clear_remote_cmd" >>"$LOG_FILE" 2>&1 || true
+            sshpass -e "$PAK_DIR/bin/dropbearmulti" dbclient -p "$SSH_PORT" -y -y "${SSH_USER}@${SSH_HOST}" "$_clear_remote_cmd" </dev/null >>"$LOG_FILE" 2>&1 || true
         elif command -v ssh >/dev/null 2>&1; then
-            sshpass -e ssh -p "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout="$SSH_TIMEOUT" "${SSH_USER}@${SSH_HOST}" "$_clear_remote_cmd" >>"$LOG_FILE" 2>&1 || true
+            sshpass -e ssh -p "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout="$SSH_TIMEOUT" "${SSH_USER}@${SSH_HOST}" "$_clear_remote_cmd" </dev/null >>"$LOG_FILE" 2>&1 || true
         fi
         log "Cleared remote authorized_keys on $SSH_HOST."
     fi
@@ -505,9 +505,15 @@ EOF
 }
 
 # --- SSH / Dropbear Transport Layer ---
-# Uses a clean wrapper script `/tmp/savesync_ssh_exec.sh` so commands can be run or piped
-# reliably with both OpenSSH (`ssh`) and Dropbear (`dbclient`) without `eval` quoting bugs.
+# CRITICAL FIX FOR DROPBEAR (`dbclient`) WHEN LAUNCHED FROM NEXTUI GUI:
+# NextUI launches paks with stdin (fd 0) closed or attached to a non-pollable handle.
+# When `dbclient` adds fd 0 to its `select()` loop, `select()` immediately returns EBADF/EINVAL
+# and `dbclient` aborts with:
+#   "dbclient: Connection to root@<IP>:22 exited: Interrupted."
+# Passing `< /dev/null` (for non-stdin commands) or a valid pipe/file on fd 0 completely prevents
+# `dbclient` from aborting!
 SSH_EXEC_WRAP="/tmp/savesync_ssh_exec.sh"
+SSH_PIPE_WRAP="/tmp/savesync_ssh_pipe.sh"
 
 get_ssh_flavor() {
     if command -v ssh >/dev/null 2>&1; then
@@ -530,9 +536,14 @@ get_ssh_flavor() {
     return 1
 }
 
-# Execute a command on the remote Knulli device
+# Execute a command on Knulli with stdin safely bound to /dev/null
 run_remote_cmd() {
-    "$SSH_EXEC_WRAP" "${SSH_USER}@${SSH_HOST}" "$1"
+    "$SSH_EXEC_WRAP" "${SSH_USER}@${SSH_HOST}" "$1" </dev/null
+}
+
+# Execute a command on Knulli while streaming caller's stdin to the remote process
+run_remote_pipe_in() {
+    "$SSH_PIPE_WRAP" "${SSH_USER}@${SSH_HOST}" "$1"
 }
 
 setup_ssh_keys() {
@@ -587,17 +598,17 @@ setup_ssh_keys() {
     log "Installing SSH public key to ${SSH_USER}@${SSH_HOST}..."
     if command -v sshpass >/dev/null 2>&1 && [ -n "$SSH_PASSWORD" ]; then
         if [ "$_flavor" = "openssh" ]; then
-            if SSHPASS="$SSH_PASSWORD" sshpass -e ssh -p "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout="$SSH_TIMEOUT" "${SSH_USER}@${SSH_HOST}" "$_remote_install_cmd" >>"$LOG_FILE" 2>&1; then
+            if SSHPASS="$SSH_PASSWORD" sshpass -e ssh -p "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout="$SSH_TIMEOUT" "${SSH_USER}@${SSH_HOST}" "$_remote_install_cmd" </dev/null >>"$LOG_FILE" 2>&1; then
                 log "Successfully installed SSH public key via sshpass + OpenSSH."
                 return 0
             fi
         elif [ -x "$PAK_DIR/bin/dropbearmulti" ]; then
-            if SSHPASS="$SSH_PASSWORD" sshpass -e "$PAK_DIR/bin/dropbearmulti" dbclient -p "$SSH_PORT" -y -y "${SSH_USER}@${SSH_HOST}" "$_remote_install_cmd" >>"$LOG_FILE" 2>&1; then
+            if SSHPASS="$SSH_PASSWORD" sshpass -e "$PAK_DIR/bin/dropbearmulti" dbclient -p "$SSH_PORT" -y -y "${SSH_USER}@${SSH_HOST}" "$_remote_install_cmd" </dev/null >>"$LOG_FILE" 2>&1; then
                 log "Successfully installed SSH public key via sshpass + dropbearmulti."
                 return 0
             fi
         elif command -v dbclient >/dev/null 2>&1; then
-            if SSHPASS="$SSH_PASSWORD" sshpass -e dbclient -p "$SSH_PORT" -y -y "${SSH_USER}@${SSH_HOST}" "$_remote_install_cmd" >>"$LOG_FILE" 2>&1; then
+            if SSHPASS="$SSH_PASSWORD" sshpass -e dbclient -p "$SSH_PORT" -y -y "${SSH_USER}@${SSH_HOST}" "$_remote_install_cmd" </dev/null >>"$LOG_FILE" 2>&1; then
                 log "Successfully installed SSH public key via sshpass + dbclient."
                 return 0
             fi
@@ -626,20 +637,28 @@ init_ssh_transport() {
         if [ "$_flavor" = "openssh" ]; then
             cat <<EOF > "$SSH_EXEC_WRAP"
 #!/bin/sh
+exec ssh -n -p "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout="$SSH_TIMEOUT" -i "$_runtime_key" -o BatchMode=yes "\$@" </dev/null
+EOF
+            cat <<EOF > "$SSH_PIPE_WRAP"
+#!/bin/sh
 exec ssh -p "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout="$SSH_TIMEOUT" -i "$_runtime_key" -o BatchMode=yes "\$@"
 EOF
-            chmod 700 "$SSH_EXEC_WRAP"
-            if run_remote_cmd "echo ok" >>"$LOG_FILE" 2>&1; then
+            chmod 700 "$SSH_EXEC_WRAP" "$SSH_PIPE_WRAP"
+            if [ "$(run_remote_cmd "echo SAVESYNC_OK" 2>>"$LOG_FILE" | tr -d '\r\n')" = "SAVESYNC_OK" ]; then
                 log "Connected to ${SSH_HOST} using OpenSSH key auth."
                 return 0
             fi
         elif [ -x "$PAK_DIR/bin/dropbearmulti" ]; then
             cat <<EOF > "$SSH_EXEC_WRAP"
 #!/bin/sh
+exec "$PAK_DIR/bin/dropbearmulti" dbclient -p "$SSH_PORT" -y -y -i "$_runtime_key" "\$@" </dev/null
+EOF
+            cat <<EOF > "$SSH_PIPE_WRAP"
+#!/bin/sh
 exec "$PAK_DIR/bin/dropbearmulti" dbclient -p "$SSH_PORT" -y -y -i "$_runtime_key" "\$@"
 EOF
-            chmod 700 "$SSH_EXEC_WRAP"
-            if run_remote_cmd "echo ok" >>"$LOG_FILE" 2>&1; then
+            chmod 700 "$SSH_EXEC_WRAP" "$SSH_PIPE_WRAP"
+            if [ "$(run_remote_cmd "echo SAVESYNC_OK" 2>>"$LOG_FILE" | tr -d '\r\n')" = "SAVESYNC_OK" ]; then
                 log "Connected to ${SSH_HOST} using Dropbear key auth."
                 return 0
             fi
@@ -661,10 +680,15 @@ EOF
             cat <<EOF > "$SSH_EXEC_WRAP"
 #!/bin/sh
 export SSHPASS='$SSH_PASSWORD'
+exec "$(command -v sshpass)" -e ssh -n -p "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout="$SSH_TIMEOUT" "\$@" </dev/null
+EOF
+            cat <<EOF > "$SSH_PIPE_WRAP"
+#!/bin/sh
+export SSHPASS='$SSH_PASSWORD'
 exec "$(command -v sshpass)" -e ssh -p "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout="$SSH_TIMEOUT" "\$@"
 EOF
-            chmod 700 "$SSH_EXEC_WRAP"
-            if run_remote_cmd "echo ok" >>"$LOG_FILE" 2>&1; then
+            chmod 700 "$SSH_EXEC_WRAP" "$SSH_PIPE_WRAP"
+            if [ "$(run_remote_cmd "echo SAVESYNC_OK" 2>>"$LOG_FILE" | tr -d '\r\n')" = "SAVESYNC_OK" ]; then
                 log "Connected to ${SSH_HOST} using sshpass + OpenSSH."
                 setup_ssh_keys >/dev/null 2>&1 || true
                 return 0
@@ -675,10 +699,15 @@ EOF
             cat <<EOF > "$SSH_EXEC_WRAP"
 #!/bin/sh
 export SSHPASS='$SSH_PASSWORD'
+exec "$(command -v sshpass)" -e "$PAK_DIR/bin/dropbearmulti" dbclient -p "$SSH_PORT" -y -y "\$@" </dev/null
+EOF
+            cat <<EOF > "$SSH_PIPE_WRAP"
+#!/bin/sh
+export SSHPASS='$SSH_PASSWORD'
 exec "$(command -v sshpass)" -e "$PAK_DIR/bin/dropbearmulti" dbclient -p "$SSH_PORT" -y -y "\$@"
 EOF
-            chmod 700 "$SSH_EXEC_WRAP"
-            if run_remote_cmd "echo ok" >>"$LOG_FILE" 2>&1; then
+            chmod 700 "$SSH_EXEC_WRAP" "$SSH_PIPE_WRAP"
+            if [ "$(run_remote_cmd "echo SAVESYNC_OK" 2>>"$LOG_FILE" | tr -d '\r\n')" = "SAVESYNC_OK" ]; then
                 log "Connected to ${SSH_HOST} using sshpass + bundled dropbearmulti (dbclient)."
                 setup_ssh_keys >/dev/null 2>&1 || true
                 return 0
@@ -699,15 +728,12 @@ EOF
 }
 
 # --- Remote Pull & Push Helpers ---
-# Uses a single compressed tar stream over SSH between Knulli and TrimUI RAM (/tmp),
-# completely avoiding Dropbear + rsync protocol errors and exFAT ownership/permission failures!
 pull_remote_saves() {
     _remote_folders="$1"
     for _k_folder in $_remote_folders; do
         mkdir -p "$REMOTE_STAGE/$_k_folder"
     done
 
-    # Use OpenSSH + rsync ONLY when local client is full OpenSSH and rsync is present
     _flavor="$(get_ssh_flavor)"
     if [ "$_flavor" = "openssh" ] && command -v rsync >/dev/null 2>&1; then
         if run_remote_cmd "command -v rsync >/dev/null 2>&1" >>"$LOG_FILE" 2>&1; then
@@ -716,7 +742,7 @@ pull_remote_saves() {
             for _k_folder in $_remote_folders; do
                 # shellcheck disable=SC2086
                 rsync -rtz --no-perms --no-owner --no-group --modify-window=2 $_filter_args \
-                    -e "$SSH_EXEC_WRAP" \
+                    -e "$SSH_PIPE_WRAP" \
                     "${SSH_USER}@${SSH_HOST}:${REMOTE_SAVES_ROOT}/${_k_folder}/" \
                     "$REMOTE_STAGE/$_k_folder/" >>"$LOG_FILE" 2>&1 || true
             done
@@ -727,7 +753,6 @@ pull_remote_saves() {
     log "Streaming remote saves from Knulli via single-connection tar-over-SSH..."
     _tmp_pull_tar="$STAGE_DIR/remote_pull.tar.gz"
 
-    # Build a clean list of existing mapped subdirectories on Knulli and archive them to stdout
     _remote_script="cd '$REMOTE_SAVES_ROOT' 2>/dev/null || exit 0; list=''; for d in $_remote_folders; do [ -d \"\$d\" ] && list=\"\$list \$d\"; done; [ -n \"\$list\" ] && tar -czf - \$list 2>/dev/null || true"
 
     run_remote_cmd "$_remote_script" > "$_tmp_pull_tar" 2>>"$LOG_FILE" || true
@@ -754,7 +779,7 @@ push_remote_saves() {
                     run_remote_cmd "mkdir -p '${REMOTE_SAVES_ROOT}/${_k_folder}'" >>"$LOG_FILE" 2>&1 || true
                     # shellcheck disable=SC2086
                     rsync -rtz --no-perms --no-owner --no-group --modify-window=2 -u $_filter_args \
-                        -e "$SSH_EXEC_WRAP" \
+                        -e "$SSH_PIPE_WRAP" \
                         "$REMOTE_STAGE/$_k_folder/" \
                         "${SSH_USER}@${SSH_HOST}:${REMOTE_SAVES_ROOT}/${_k_folder}/" >>"$LOG_FILE" 2>&1
                 fi
@@ -773,15 +798,15 @@ push_remote_saves() {
 
     if [ -n "$_dirs_to_push" ]; then
         _tmp_push_tar="$STAGE_DIR/remote_push.tar.gz"
-        # BusyBox tar compatible: `tar -czf <file> -C <dir> <folders>`
         # shellcheck disable=SC2086
         tar -czf "$_tmp_push_tar" -C "$REMOTE_STAGE" $_dirs_to_push 2>>"$LOG_FILE"
         if [ -s "$_tmp_push_tar" ]; then
-            if ! run_remote_cmd "mkdir -p '$REMOTE_SAVES_ROOT' && tar -xzf - -C '$REMOTE_SAVES_ROOT'" < "$_tmp_push_tar" >>"$LOG_FILE" 2>&1; then
+            if ! run_remote_pipe_in "mkdir -p '$REMOTE_SAVES_ROOT' && tar -xzf - -C '$REMOTE_SAVES_ROOT' && sync" < "$_tmp_push_tar" >>"$LOG_FILE" 2>&1; then
                 rm -f "$_tmp_push_tar"
                 log "ERROR: Failed to unpack pushed saves on Knulli."
                 return 1
             fi
+            log "Successfully uploaded and unpacked saves on Knulli!"
         fi
         rm -f "$_tmp_push_tar"
     fi
@@ -789,7 +814,6 @@ push_remote_saves() {
 }
 
 # --- Backup & Rotation Functions (Keep Last N Compressed Backups) ---
-# Compatible with BusyBox v1.27.2 tar (uses `-X <exclude_file>` instead of GNU `--exclude=`)
 rotate_backups() {
     _prefix="$1"
     _keep="$BACKUP_KEEP_COUNT"
@@ -811,7 +835,6 @@ create_backups() {
     mkdir -p "$BACKUP_DIR"
     _ex_file="$(get_tar_exclude_file)"
 
-    # 1. Local NextUI Saves Backup
     if [ -d "$LOCAL_SAVES_ROOT" ] && [ -n "$(ls -A "$LOCAL_SAVES_ROOT" 2>/dev/null)" ]; then
         _local_archive="$BACKUP_DIR/local_${_run_ts}.tar.gz"
         log "Creating compressed local backup: $_local_archive"
@@ -820,7 +843,6 @@ create_backups() {
         rotate_backups "local"
     fi
 
-    # 2. Remote Knulli Saves Backup (from downloaded staging snapshot)
     if [ "$BACKUP_REMOTE" = "true" ] && [ -d "$_remote_stage_raw" ] && [ -n "$(ls -A "$_remote_stage_raw" 2>/dev/null)" ]; then
         _remote_archive="$BACKUP_DIR/remote_${_run_ts}.tar.gz"
         log "Creating compressed remote backup: $_remote_archive"
@@ -836,8 +858,6 @@ build_rsync_filter_args() {
     echo "$_args"
 }
 
-# Copy file preserving modification timestamp safely on exFAT/FAT32 SD cards
-# (Avoids `cp -p` failing or warning when trying to chown/chmod on exFAT)
 copy_save_with_mtime() {
     _src="$1"
     _dst="$2"

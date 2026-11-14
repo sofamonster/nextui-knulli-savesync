@@ -122,6 +122,10 @@ case "\$last_arg" in
         echo "ok"
         exit 0
         ;;
+    "echo SAVESYNC_OK")
+        echo "SAVESYNC_OK"
+        exit 0
+        ;;
     *)
         rewritten_cmd="\$(echo "\$last_arg" | sed "s|/userdata/saves|$REMOTE_MOCK|g")"
         eval "\$rewritten_cmd"
