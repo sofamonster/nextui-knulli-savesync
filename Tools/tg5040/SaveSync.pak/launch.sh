@@ -270,6 +270,12 @@ run_connection_diagnostics() {
         log "SSH Auth [${SSH_USER}@${SSH_HOST}]: FAILED (See errors above)"
         show_ui_message "Diagnostics Failed! Opening Debug Log..." 2
     fi
+    # 4. Check remote rsync & tar availability
+    if [ -n "$SSH_CMD" ]; then
+        _rem_tools="$(eval "$SSH_CMD \"${SSH_USER}@${SSH_HOST}\" \"command -v rsync || echo 'no-rsync'; command -v tar || echo 'no-tar'\"" 2>/dev/null | tr '\n' ' ' || true)"
+        log "Remote tools on Knulli: $_rem_tools"
+    fi
+
     log "=== END OF DIAGNOSTICS ==="
     view_debug_logs
 }
@@ -475,6 +481,7 @@ get_mtime() {
 # as well as bundled `sshpass` (with zero dependency on `setsid`).
 SSH_CMD=""
 RSYNC_RSH=""
+REMOTE_HAS_RSYNC="0"
 
 # Detect whether `ssh` on this device is OpenSSH or Dropbear (or missing -> use bundled dropbearmulti)
 get_ssh_flavor() {
@@ -496,6 +503,32 @@ get_ssh_flavor() {
     fi
     echo "none"
     return 1
+}
+
+# Create a clean RSH wrapper script in /tmp that strips any `-l <user>` argument injected by rsync
+# before forwarding to dbclient/ssh (fixes rsync + dbclient argument ordering bug)
+create_rsh_wrapper() {
+    _inner_cmd="$1"
+    _wrap_path="/tmp/savesync_rsh_wrap.sh"
+    cat <<EOF > "$_wrap_path"
+#!/bin/sh
+export SSHPASS='$SSH_PASSWORD'
+args=""
+while [ "\$#" -gt 0 ]; do
+    case "\$1" in
+        -l)
+            shift 2
+            ;;
+        *)
+            args="\$args \"\$1\""
+            shift
+            ;;
+    esac
+done
+eval "exec $_inner_cmd \$args"
+EOF
+    chmod 700 "$_wrap_path"
+    echo "$_wrap_path"
 }
 
 setup_ssh_keys() {
@@ -592,18 +625,20 @@ init_ssh_transport() {
         chmod 600 "$_runtime_key" 2>/dev/null || true
 
         if [ "$_flavor" = "openssh" ]; then
-            _opts="-p $SSH_PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=$SSH_TIMEOUT -i $_runtime_key -o BatchMode=yes"
-            if ssh $_opts "${SSH_USER}@${SSH_HOST}" "echo ok" >>"$LOG_FILE" 2>&1; then
-                SSH_CMD="ssh $_opts"
-                RSYNC_RSH="ssh $_opts"
+            _opts="-p $SSH_PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=$SSH_TIMEOUT -i $_runtime_key -o BatchMode=yes -l $SSH_USER"
+            if ssh $_opts "${SSH_HOST}" "echo ok" >>"$LOG_FILE" 2>&1; then
+                _wrap="$(create_rsh_wrapper "ssh $_opts")"
+                SSH_CMD="$_wrap"
+                RSYNC_RSH="$_wrap"
                 log "Connected to ${SSH_HOST} using OpenSSH key auth."
                 return 0
             fi
         elif [ -x "$PAK_DIR/bin/dropbearmulti" ]; then
-            _opts="-p $SSH_PORT -y -y -i $_runtime_key"
-            if "$PAK_DIR/bin/dropbearmulti" dbclient $_opts "${SSH_USER}@${SSH_HOST}" "echo ok" >>"$LOG_FILE" 2>&1; then
-                SSH_CMD="\"$PAK_DIR/bin/dropbearmulti\" dbclient $_opts"
-                RSYNC_RSH="$PAK_DIR/bin/dropbearmulti dbclient $_opts"
+            _opts="-p $SSH_PORT -y -y -i $_runtime_key -l $SSH_USER"
+            if "$PAK_DIR/bin/dropbearmulti" dbclient $_opts "${SSH_HOST}" "echo ok" >>"$LOG_FILE" 2>&1; then
+                _wrap="$(create_rsh_wrapper "\"$PAK_DIR/bin/dropbearmulti\" dbclient $_opts")"
+                SSH_CMD="$_wrap"
+                RSYNC_RSH="$_wrap"
                 log "Connected to ${SSH_HOST} using Dropbear key auth."
                 return 0
             fi
@@ -611,8 +646,20 @@ init_ssh_transport() {
         return 1
     }
 
+    # --- Helper to detect if remote Knulli host has rsync installed ---
+    check_remote_capabilities() {
+        REMOTE_HAS_RSYNC="0"
+        if eval "$SSH_CMD \"${SSH_USER}@${SSH_HOST}\" \"command -v rsync >/dev/null 2>&1\"" >>"$LOG_FILE" 2>&1; then
+            REMOTE_HAS_RSYNC="1"
+            log "Remote Knulli host supports rsync."
+        else
+            log "Remote Knulli host does not have rsync; using fast tar-over-SSH streaming."
+        fi
+    }
+
     # 1. Try existing key authentication first
     if try_key_auth "$SSH_KEY_PATH" || try_key_auth "${SSH_KEY_PATH}_dropbear"; then
+        check_remote_capabilities
         return 0
     fi
 
@@ -622,38 +669,27 @@ init_ssh_transport() {
         log "Testing sshpass password authentication to ${SSH_USER}@${SSH_HOST}:${SSH_PORT}..."
 
         if [ "$_flavor" = "openssh" ]; then
-            _opts="-p $SSH_PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=$SSH_TIMEOUT"
-            if sshpass -e ssh $_opts "${SSH_USER}@${SSH_HOST}" "echo ok" >>"$LOG_FILE" 2>&1; then
-                # Create a clean wrapper script in /tmp so rsync -e and eval "$SSH_CMD" work seamlessly
-                _wrap="/tmp/savesync_ssh_wrap.sh"
-                cat <<EOF > "$_wrap"
-#!/bin/sh
-export SSHPASS='$SSH_PASSWORD'
-exec "$(command -v sshpass)" -e ssh $_opts "\$@"
-EOF
-                chmod 700 "$_wrap"
+            _opts="-p $SSH_PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=$SSH_TIMEOUT -l $SSH_USER"
+            if sshpass -e ssh $_opts "${SSH_HOST}" "echo ok" >>"$LOG_FILE" 2>&1; then
+                _wrap="$(create_rsh_wrapper "\"$(command -v sshpass)\" -e ssh $_opts")"
                 SSH_CMD="$_wrap"
                 RSYNC_RSH="$_wrap"
                 log "Connected to ${SSH_HOST} using sshpass + OpenSSH."
-                # Opportunistically install SSH key in background for future runs
                 setup_ssh_keys >/dev/null 2>&1 || true
+                check_remote_capabilities
                 return 0
             fi
         fi
 
         if [ -x "$PAK_DIR/bin/dropbearmulti" ]; then
-            _opts="-p $SSH_PORT -y -y"
-            if sshpass -e "$PAK_DIR/bin/dropbearmulti" dbclient $_opts "${SSH_USER}@${SSH_HOST}" "echo ok" >>"$LOG_FILE" 2>&1; then
-                _wrap="/tmp/savesync_ssh_wrap.sh"
-                cat <<EOF > "$_wrap"
-#!/bin/sh
-export SSHPASS='$SSH_PASSWORD'
-exec "$(command -v sshpass)" -e "$PAK_DIR/bin/dropbearmulti" dbclient $_opts "\$@"
-EOF
-                chmod 700 "$_wrap"
+            _opts="-p $SSH_PORT -y -y -l $SSH_USER"
+            if sshpass -e "$PAK_DIR/bin/dropbearmulti" dbclient $_opts "${SSH_HOST}" "echo ok" >>"$LOG_FILE" 2>&1; then
+                _wrap="$(create_rsh_wrapper "\"$(command -v sshpass)\" -e \"$PAK_DIR/bin/dropbearmulti\" dbclient $_opts")"
                 SSH_CMD="$_wrap"
                 RSYNC_RSH="$_wrap"
                 log "Connected to ${SSH_HOST} using sshpass + bundled dropbearmulti (dbclient)."
+                setup_ssh_keys >/dev/null 2>&1 || true
+                check_remote_capabilities
                 return 0
             fi
         fi
@@ -663,6 +699,7 @@ EOF
     show_ui_message "Setting up SSH auth with $SSH_HOST..." 0
     if setup_ssh_keys; then
         if try_key_auth "$SSH_KEY_PATH" || try_key_auth "${SSH_KEY_PATH}_dropbear"; then
+            check_remote_capabilities
             return 0
         fi
     fi
@@ -676,9 +713,7 @@ pull_remote_saves() {
     _remote_folders="$1"
     _filter_args="$(build_rsync_filter_args)"
 
-    # Note: Knulli (Batocera) ships with `rsync`, whereas Dropbear on Knulli might or might not have rsync in default PATH.
-    # Try rsync first; if rsync fails (e.g., remote rsync missing or protocol mismatch), automatically fall back to tar-over-SSH!
-    if command -v rsync >/dev/null 2>&1; then
+    if [ "$REMOTE_HAS_RSYNC" = "1" ] && command -v rsync >/dev/null 2>&1; then
         log "Using rsync transport to pull remote saves..."
         _rsync_ok=0
         for _k_folder in $_remote_folders; do
@@ -694,10 +729,10 @@ pull_remote_saves() {
         if [ "$_rsync_ok" -eq 1 ]; then
             return 0
         fi
-        log "Rsync pull returned non-zero or empty; verifying with native tar-over-SSH transport..."
+        log "Rsync pull returned non-zero or empty; pulling via single-connection tar-over-SSH..."
     fi
 
-    log "Using native tar-over-SSH transport to pull saves..."
+    log "Using single-connection tar-over-SSH transport to pull saves..."
     for _k_folder in $_remote_folders; do
         mkdir -p "$REMOTE_STAGE/$_k_folder"
     done
@@ -708,27 +743,30 @@ push_remote_saves() {
     _remote_folders="$1"
     _filter_args="$(build_rsync_filter_args)"
 
-    if command -v rsync >/dev/null 2>&1; then
+    if [ "$REMOTE_HAS_RSYNC" = "1" ] && command -v rsync >/dev/null 2>&1; then
         log "Using rsync transport to push updated saves..."
         _push_failed=0
         for _k_folder in $_remote_folders; do
             if [ -d "$REMOTE_STAGE/$_k_folder" ] && [ -n "$(ls -A "$REMOTE_STAGE/$_k_folder" 2>/dev/null)" ]; then
+                # Create target directory on remote first so rsync never fails on missing parent dir
+                eval "$SSH_CMD \"${SSH_USER}@${SSH_HOST}\" \"mkdir -p '${REMOTE_SAVES_ROOT}/${_k_folder}'\"" >>"$LOG_FILE" 2>&1 || true
                 # shellcheck disable=SC2086
                 if ! rsync -rtz --modify-window=2 -u $_filter_args \
                     -e "$RSYNC_RSH" \
                     "$REMOTE_STAGE/$_k_folder/" \
                     "${SSH_USER}@${SSH_HOST}:${REMOTE_SAVES_ROOT}/${_k_folder}/" >>"$LOG_FILE" 2>&1; then
                     _push_failed=1
+                    break
                 fi
             fi
         done
         if [ "$_push_failed" -eq 0 ]; then
             return 0
         fi
-        log "Rsync push encountered an error; falling back to native tar-over-SSH push..."
+        log "Rsync push interrupted; falling back to single-connection tar-over-SSH push..."
     fi
 
-    log "Using native tar-over-SSH transport to push saves..."
+    log "Using single-connection tar-over-SSH transport to push saves..."
     _dirs_to_push=""
     for _k_folder in $_remote_folders; do
         if [ -d "$REMOTE_STAGE/$_k_folder" ] && [ -n "$(ls -A "$REMOTE_STAGE/$_k_folder" 2>/dev/null)" ]; then
@@ -737,9 +775,13 @@ push_remote_saves() {
     done
     if [ -n "$_dirs_to_push" ]; then
         # shellcheck disable=SC2086
-        tar -cf - -C "$REMOTE_STAGE" $_dirs_to_push 2>>"$LOG_FILE" | \
-            eval "$SSH_CMD \"${SSH_USER}@${SSH_HOST}\" \"mkdir -p '$REMOTE_SAVES_ROOT' && tar -xf - -p -C '$REMOTE_SAVES_ROOT'\"" >>"$LOG_FILE" 2>&1
+        if ! (tar -cf - -C "$REMOTE_STAGE" $_dirs_to_push 2>>"$LOG_FILE" | \
+            eval "$SSH_CMD \"${SSH_USER}@${SSH_HOST}\" \"mkdir -p '$REMOTE_SAVES_ROOT' && tar -xf - -p -C '$REMOTE_SAVES_ROOT'\"" >>"$LOG_FILE" 2>&1); then
+            log "ERROR: Failed to push saves via tar-over-SSH."
+            return 1
+        fi
     fi
+    return 0
 }
 
 # --- Backup & Rotation Functions (Keep Last N Compressed Backups) ---
@@ -1004,7 +1046,12 @@ run_sync() {
     if [ "$DRY_RUN" != "true" ] && [ "$PUSH_COUNT" -gt 0 ]; then
         show_ui_message "Uploading $PUSH_COUNT save(s) to Knulli..." 0
         log "Pushing $PUSH_COUNT updated save(s) to ${SSH_USER}@${SSH_HOST}:${REMOTE_SAVES_ROOT}..."
-        push_remote_saves "$_remote_folders"
+        if ! push_remote_saves "$_remote_folders"; then
+            rm -rf "$STAGE_DIR"
+            STAGE_DIR=""
+            show_ui_message "Upload failed! Opening Debug Log..." 3
+            return 1
+        fi
     fi
 
     rm -rf "$STAGE_DIR"
