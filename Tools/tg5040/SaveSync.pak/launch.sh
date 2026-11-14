@@ -274,6 +274,36 @@ run_connection_diagnostics() {
     view_debug_logs
 }
 
+# Wipe local & remote Knulli SSH keys using password login and generate a fresh pair
+reset_and_reinstall_ssh_keys() {
+    load_config
+    show_ui_message "Resetting SSH keys on TrimUI & $SSH_HOST..." 0
+    log "=== RESETTING SSH KEYS ==="
+
+    rm -rf "$PAK_DIR/.ssh" /tmp/savesync_id_key
+    mkdir -p "$PAK_DIR/.ssh"
+
+    _clear_remote_cmd="rm -f ~/.ssh/authorized_keys /userdata/system/.ssh/authorized_keys /userdata/system/ssh/authorized_keys && (batocera-save-overlay >/dev/null 2>&1 || true)"
+    if command -v sshpass >/dev/null 2>&1 && [ -n "$SSH_PASSWORD" ]; then
+        export SSHPASS="$SSH_PASSWORD"
+        if [ -x "$PAK_DIR/bin/dropbearmulti" ]; then
+            sshpass -e "$PAK_DIR/bin/dropbearmulti" dbclient -p "$SSH_PORT" -y -y "${SSH_USER}@${SSH_HOST}" "$_clear_remote_cmd" >>"$LOG_FILE" 2>&1 || true
+        elif command -v ssh >/dev/null 2>&1; then
+            sshpass -e ssh -p "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout="$SSH_TIMEOUT" "${SSH_USER}@${SSH_HOST}" "$_clear_remote_cmd" >>"$LOG_FILE" 2>&1 || true
+        fi
+        log "Cleared remote authorized_keys on $SSH_HOST."
+    fi
+
+    if setup_ssh_keys && init_ssh_transport; then
+        show_ui_message "SSH Keys Reset & Verified with $SSH_HOST!" 3
+        log "=== SSH KEY RESET SUCCESSFUL ==="
+    else
+        show_ui_message "Key reset failed! Opening Debug Log..." 3
+        log "=== SSH KEY RESET FAILED ==="
+        view_debug_logs
+    fi
+}
+
 run_interactive_menu() {
     ensure_binaries
 
@@ -299,6 +329,7 @@ SSH Port: $SSH_PORT
 SSH Username: $SSH_USER
 SSH Password: $_pw_masked
 Test Connection & Diagnose
+Reset & Re-install SSH Keys
 View Debug Log (savesync.log)
 Startup Mode: $STARTUP_MODE
 Backup Remote Saves: $BACKUP_REMOTE
@@ -365,6 +396,9 @@ EOF
                 ;;
             "Test Connection & Diagnose"*)
                 run_connection_diagnostics
+                ;;
+            "Reset & Re-install SSH Keys"*)
+                reset_and_reinstall_ssh_keys
                 ;;
             "View Debug Log"*)
                 view_debug_logs
@@ -513,7 +547,7 @@ setup_ssh_keys() {
         return 1
     fi
 
-    _remote_install_cmd="mkdir -p ~/.ssh && chmod 700 ~/.ssh && grep -qF '$_pub_key' ~/.ssh/authorized_keys 2>/dev/null || echo '$_pub_key' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && (batocera-save-overlay >/dev/null 2>&1 || true)"
+    _remote_install_cmd="mkdir -p ~/.ssh /userdata/system/.ssh && chmod 700 ~/.ssh /userdata/system/.ssh && for f in ~/.ssh/authorized_keys /userdata/system/.ssh/authorized_keys; do grep -qF '$_pub_key' \"\$f\" 2>/dev/null || echo '$_pub_key' >> \"\$f\"; chmod 600 \"\$f\" 2>/dev/null || true; done && (batocera-save-overlay >/dev/null 2>&1 || true)"
 
     log "Installing SSH public key to ${SSH_USER}@${SSH_HOST}..."
     if command -v sshpass >/dev/null 2>&1 && [ -n "$SSH_PASSWORD" ]; then
