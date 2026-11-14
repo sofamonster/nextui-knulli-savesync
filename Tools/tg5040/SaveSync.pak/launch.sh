@@ -116,6 +116,16 @@ KEYBOARD_BIN="$(find_ui_binary minui-keyboard || true)"
 
 # Auto-fetch UI helper binaries and static rsync on first launch if missing and internet is reachable
 ensure_binaries() {
+    # Ensure NextUI .media and .res icon previews exist for SaveSync in Tools/tg5040/
+    if [ -f "$PAK_DIR/icon.png" ]; then
+        _tools_parent="$(dirname "$PAK_DIR")"
+        for _art_dir in "$_tools_parent/.media" "$_tools_parent/.res"; do
+            mkdir -p "$_art_dir" 2>/dev/null || true
+            [ -f "$_art_dir/SaveSync.png" ] || cp "$PAK_DIR/icon.png" "$_art_dir/SaveSync.png" 2>/dev/null || true
+            [ -f "$_art_dir/SaveSync.pak.png" ] || cp "$PAK_DIR/icon.png" "$_art_dir/SaveSync.pak.png" 2>/dev/null || true
+        done
+    fi
+
     mkdir -p "$PAK_DIR/bin"
     if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
         return 0

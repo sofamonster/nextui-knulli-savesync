@@ -1,11 +1,12 @@
 {
   "name": "SaveSync (Knulli)",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "TOOL",
   "description": "Bidirectional in-game save synchronization with Knulli (RG28XX) over SSH + rsync with folder/extension mapping and rolling 3-run backups.",
   "author": "SaveSync",
   "platforms": [
     "tg5040"
   ],
-  "launch": "launch.sh"
+  "launch": "launch.sh",
+  "icon": "icon.png"
 }
