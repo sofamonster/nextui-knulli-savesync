@@ -114,7 +114,7 @@ PRESENTER_BIN="$(find_ui_binary minui-presenter || true)"
 LIST_BIN="$(find_ui_binary minui-list || true)"
 KEYBOARD_BIN="$(find_ui_binary minui-keyboard || true)"
 
-# Auto-fetch UI helper binaries and static rsync on first launch if missing and internet is reachable
+# Ensure permissions and artwork previews
 ensure_binaries() {
     # Ensure NextUI .media and .res icon previews exist for SaveSync in Tools/tg5040/
     if [ -f "$PAK_DIR/icon.png" ]; then
@@ -127,51 +127,11 @@ ensure_binaries() {
     fi
 
     mkdir -p "$PAK_DIR/bin"
-    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
-        return 0
-    fi
+    chmod +x "$PAK_DIR/bin"/* 2>/dev/null || true
 
-    # 1. Fetch static aarch64 rsync if rsync is not installed on TrimUI
-    if ! command -v rsync >/dev/null 2>&1; then
-        _rsync_dest="$PAK_DIR/bin/rsync"
-        _rsync_url="https://raw.githubusercontent.com/ryanwoodsmall/static-binaries/master/aarch64/rsync"
-        log "Attempting to auto-download static aarch64 rsync binary..."
-        if command -v curl >/dev/null 2>&1; then
-            curl -fsSL -L --connect-timeout 5 "$_rsync_url" -o "$_rsync_dest" 2>/dev/null || true
-        elif command -v wget >/dev/null 2>&1; then
-            wget -q -T 5 -O "$_rsync_dest" "$_rsync_url" 2>/dev/null || true
-        fi
-        if [ -s "$_rsync_dest" ]; then
-            chmod +x "$_rsync_dest"
-            log "Installed static rsync binary to $_rsync_dest"
-        else
-            rm -f "$_rsync_dest"
-        fi
-    fi
-
-    # 2. Fetch NextUI UI binaries if missing
-    if [ -z "$LIST_BIN" ] || [ -z "$KEYBOARD_BIN" ]; then
-        for _pair in "josegonzalez/minui-list:minui-list" "josegonzalez/minui-keyboard:minui-keyboard" "josegonzalez/minui-presenter:minui-presenter"; do
-            _repo="${_pair%%:*}"
-            _name="${_pair##*:}"
-            _dest="$PAK_DIR/bin/$_name"
-            [ -x "$_dest" ] && continue
-            _url="https://github.com/${_repo}/releases/latest/download/${_name}-${PLATFORM}-nextui"
-            if command -v curl >/dev/null 2>&1; then
-                curl -fsSL -L --connect-timeout 4 "$_url" -o "$_dest" 2>/dev/null || true
-            elif command -v wget >/dev/null 2>&1; then
-                wget -q -T 4 -O "$_dest" "$_url" 2>/dev/null || true
-            fi
-            if [ -s "$_dest" ]; then
-                chmod +x "$_dest"
-            else
-                rm -f "$_dest"
-            fi
-        done
-        PRESENTER_BIN="$(find_ui_binary minui-presenter || true)"
-        LIST_BIN="$(find_ui_binary minui-list || true)"
-        KEYBOARD_BIN="$(find_ui_binary minui-keyboard || true)"
-    fi
+    PRESENTER_BIN="$(find_ui_binary minui-presenter || true)"
+    LIST_BIN="$(find_ui_binary minui-list || true)"
+    KEYBOARD_BIN="$(find_ui_binary minui-keyboard || true)"
 }
 
 # --- On-Screen Display Helper ---
@@ -254,6 +214,66 @@ mask_password() {
     fi
 }
 
+# On-device log & diagnostics viewer using minui-list
+view_debug_logs() {
+    if [ -z "$LIST_BIN" ]; then
+        cat "$LOG_FILE"
+        return 0
+    fi
+    _log_view="$(mktemp "${TMPDIR:-/tmp}/savesync_logview.XXXXXX")"
+    _dummy_out="$(mktemp "${TMPDIR:-/tmp}/savesync_logout.XXXXXX")"
+    if [ -s "$LOG_FILE" ]; then
+        # Show newest log lines at the top so user immediately sees errors
+        awk '{lines[NR]=$0} END {for(i=NR;i>=1;i--) print lines[i]}' "$LOG_FILE" > "$_log_view"
+    else
+        echo "No log entries yet." > "$_log_view"
+    fi
+    "$LIST_BIN" \
+        --file "$_log_view" \
+        --format text \
+        --title "Debug Log (Press B to return)" \
+        --write-location "$_dummy_out" >/dev/null 2>&1 || true
+    rm -f "$_log_view" "$_dummy_out"
+}
+
+# Run step-by-step connection diagnostics and show results in the on-device log viewer
+run_connection_diagnostics() {
+    load_config
+    show_ui_message "Running diagnostics to $SSH_HOST..." 0
+    log "=== STARTING CONNECTION DIAGNOSTICS ==="
+    log "Target: ${SSH_USER}@${SSH_HOST}:${SSH_PORT}"
+    log "Local IP(s): $(ip -4 addr show 2>/dev/null | awk '/inet / {print $2}' | tr '\n' ' ' || ifconfig 2>/dev/null | awk '/inet addr/ {print $2}' || echo 'unknown')"
+
+    # 1. Check binaries
+    for _b in ssh dbclient dropbearmulti sshpass rsync tar; do
+        if command -v "$_b" >/dev/null 2>&1; then
+            log "Binary [$_b]: FOUND ($(command -v "$_b"))"
+        else
+            log "Binary [$_b]: MISSING"
+        fi
+    done
+
+    # 2. Ping test
+    if ping -c 1 -W 3 "$SSH_HOST" >/dev/null 2>&1; then
+        log "Ping [$SSH_HOST]: OK (Host is reachable on Wi-Fi)"
+    else
+        log "Ping [$SSH_HOST]: FAILED (Host unreachable! Check Wi-Fi & IP)"
+    fi
+
+    # 3. SSH Auth & Key Setup test
+    if init_ssh_transport; then
+        log "SSH Auth [${SSH_USER}@${SSH_HOST}]: SUCCESS!"
+        _rem_check="$(eval "$SSH_CMD \"${SSH_USER}@${SSH_HOST}\" \"ls -ld '$REMOTE_SAVES_ROOT' 2>&1\"" 2>&1 || true)"
+        log "Remote Saves Dir: $_rem_check"
+        show_ui_message "Diagnostics Passed! Connected to $SSH_HOST" 2
+    else
+        log "SSH Auth [${SSH_USER}@${SSH_HOST}]: FAILED (See errors above)"
+        show_ui_message "Diagnostics Failed! Opening Debug Log..." 2
+    fi
+    log "=== END OF DIAGNOSTICS ==="
+    view_debug_logs
+}
+
 run_interactive_menu() {
     ensure_binaries
 
@@ -278,7 +298,8 @@ RG28XX IP / Host: $SSH_HOST
 SSH Port: $SSH_PORT
 SSH Username: $SSH_USER
 SSH Password: $_pw_masked
-Test & Setup SSH Key Auth
+Test Connection & Diagnose
+View Debug Log (savesync.log)
 Startup Mode: $STARTUP_MODE
 Backup Remote Saves: $BACKUP_REMOTE
 Exit
@@ -302,11 +323,15 @@ EOF
         case "$_selection" in
             "Sync Saves Now"*)
                 DRY_RUN="false"
-                run_sync "sync" || true
+                if ! run_sync "sync"; then
+                    view_debug_logs
+                fi
                 ;;
             "Dry-Run Sync"*)
                 DRY_RUN="true"
-                run_sync "sync" || true
+                if ! run_sync "sync"; then
+                    view_debug_logs
+                fi
                 ;;
             "RG28XX IP / Host:"*)
                 if _new_host="$(prompt_keyboard "RG28XX IP or Hostname" "$SSH_HOST")"; then
@@ -338,8 +363,11 @@ EOF
                     show_ui_message "Saved SSH Password!" 2
                 fi
                 ;;
-            "Test & Setup SSH Key Auth")
-                run_sync "setup-auth" || true
+            "Test Connection & Diagnose"*)
+                run_connection_diagnostics
+                ;;
+            "View Debug Log"*)
+                view_debug_logs
                 ;;
             "Startup Mode:"*)
                 if [ "$STARTUP_MODE" = "menu" ]; then
@@ -408,132 +436,199 @@ get_mtime() {
     fi
 }
 
-# --- SSH / Rsync / Tar-over-SSH Transport Layer ---
+# --- SSH / Dropbear / Rsync / Tar-over-SSH Transport Layer ---
+# Supports BOTH OpenSSH (`ssh`) and Dropbear (`dbclient` / `dropbearmulti dbclient`)
+# as well as bundled `sshpass` (with zero dependency on `setsid`).
 SSH_CMD=""
 RSYNC_RSH=""
 
+# Detect whether `ssh` on this device is OpenSSH or Dropbear (or missing -> use bundled dropbearmulti)
+get_ssh_flavor() {
+    if command -v ssh >/dev/null 2>&1; then
+        if ssh -V 2>&1 | grep -qi "Dropbear"; then
+            echo "dropbear-ssh"
+            return 0
+        fi
+        echo "openssh"
+        return 0
+    fi
+    if [ -x "$PAK_DIR/bin/dropbearmulti" ]; then
+        echo "dropbearmulti"
+        return 0
+    fi
+    if command -v dbclient >/dev/null 2>&1; then
+        echo "dbclient"
+        return 0
+    fi
+    echo "none"
+    return 1
+}
+
 setup_ssh_keys() {
+    _flavor="$(get_ssh_flavor)"
     _key_dir="$(dirname "$SSH_KEY_PATH")"
     mkdir -p "$_key_dir"
-    chmod 700 "$_key_dir"
+    chmod 700 "$_key_dir" 2>/dev/null || true
 
-    if [ ! -f "$SSH_KEY_PATH" ]; then
-        log "Generating new SSH key at $SSH_KEY_PATH..."
-        if command -v ssh-keygen >/dev/null 2>&1; then
-            ssh-keygen -t ed25519 -f "$SSH_KEY_PATH" -N "" -q 2>>"$LOG_FILE" || \
-            ssh-keygen -t rsa -b 2048 -f "$SSH_KEY_PATH" -N "" -q 2>>"$LOG_FILE"
-        elif command -v dropbearkey >/dev/null 2>&1; then
-            dropbearkey -t ed25519 -f "$SSH_KEY_PATH" >>"$LOG_FILE" 2>&1
-            dropbearkey -y -f "$SSH_KEY_PATH" | grep "^ssh-" > "${SSH_KEY_PATH}.pub"
-        else
-            log "ERROR: Neither ssh-keygen nor dropbearkey found to generate keys."
-            return 1
+    # For Dropbear client, keys must be in Dropbear format; for OpenSSH, OpenSSH format
+    if [ "$_flavor" = "openssh" ]; then
+        if [ ! -f "$SSH_KEY_PATH" ]; then
+            log "Generating new OpenSSH key at $SSH_KEY_PATH..."
+            if command -v ssh-keygen >/dev/null 2>&1; then
+                ssh-keygen -t ed25519 -f "$SSH_KEY_PATH" -N "" -q 2>>"$LOG_FILE" || \
+                ssh-keygen -t rsa -b 2048 -f "$SSH_KEY_PATH" -N "" -q 2>>"$LOG_FILE"
+            else
+                log "WARN: ssh-keygen not found for OpenSSH key generation."
+                return 1
+            fi
+            chmod 600 "$SSH_KEY_PATH" 2>/dev/null || true
         fi
-        chmod 600 "$SSH_KEY_PATH"
-    fi
-
-    if [ ! -f "${SSH_KEY_PATH}.pub" ]; then
-        if command -v ssh-keygen >/dev/null 2>&1; then
-            ssh-keygen -y -f "$SSH_KEY_PATH" > "${SSH_KEY_PATH}.pub" 2>>"$LOG_FILE"
-        elif command -v dropbearkey >/dev/null 2>&1; then
-            dropbearkey -y -f "$SSH_KEY_PATH" | grep "^ssh-" > "${SSH_KEY_PATH}.pub"
+        if [ ! -f "${SSH_KEY_PATH}.pub" ] && command -v ssh-keygen >/dev/null 2>&1; then
+            ssh-keygen -y -f "$SSH_KEY_PATH" > "${SSH_KEY_PATH}.pub" 2>>"$LOG_FILE" || true
+        fi
+    else
+        # Dropbear key format
+        SSH_KEY_PATH="${SSH_KEY_PATH}_dropbear"
+        if [ ! -f "$SSH_KEY_PATH" ]; then
+            log "Generating new Dropbear SSH key at $SSH_KEY_PATH..."
+            if [ -x "$PAK_DIR/bin/dropbearmulti" ]; then
+                "$PAK_DIR/bin/dropbearmulti" dropbearkey -t ed25519 -f "$SSH_KEY_PATH" >>"$LOG_FILE" 2>&1 || \
+                "$PAK_DIR/bin/dropbearmulti" dropbearkey -t rsa -f "$SSH_KEY_PATH" >>"$LOG_FILE" 2>&1
+                "$PAK_DIR/bin/dropbearmulti" dropbearkey -y -f "$SSH_KEY_PATH" | grep "^ssh-" > "${SSH_KEY_PATH}.pub"
+            elif command -v dropbearkey >/dev/null 2>&1; then
+                dropbearkey -t ed25519 -f "$SSH_KEY_PATH" >>"$LOG_FILE" 2>&1 || \
+                dropbearkey -t rsa -f "$SSH_KEY_PATH" >>"$LOG_FILE" 2>&1
+                dropbearkey -y -f "$SSH_KEY_PATH" | grep "^ssh-" > "${SSH_KEY_PATH}.pub"
+            else
+                log "WARN: dropbearkey not found."
+                return 1
+            fi
+            chmod 600 "$SSH_KEY_PATH" 2>/dev/null || true
         fi
     fi
 
     _pub_key="$(cat "${SSH_KEY_PATH}.pub" 2>/dev/null || true)"
     if [ -z "$_pub_key" ]; then
-        log "ERROR: Failed to read public key ${SSH_KEY_PATH}.pub"
+        log "WARN: Could not read public key ${SSH_KEY_PATH}.pub"
         return 1
     fi
 
     _remote_install_cmd="mkdir -p ~/.ssh && chmod 700 ~/.ssh && grep -qF '$_pub_key' ~/.ssh/authorized_keys 2>/dev/null || echo '$_pub_key' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && (batocera-save-overlay >/dev/null 2>&1 || true)"
 
-    if ssh -p "$SSH_PORT" -i "$SSH_KEY_PATH" -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout="$SSH_TIMEOUT" "${SSH_USER}@${SSH_HOST}" "true" >/dev/null 2>&1; then
-        log "SSH key authentication already working."
-        return 0
-    fi
-
-    log "Attempting automatic SSH key deployment to ${SSH_USER}@${SSH_HOST}..."
+    log "Installing SSH public key to ${SSH_USER}@${SSH_HOST}..."
     if command -v sshpass >/dev/null 2>&1 && [ -n "$SSH_PASSWORD" ]; then
-        if SSHPASS="$SSH_PASSWORD" sshpass -e ssh -p "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout="$SSH_TIMEOUT" "${SSH_USER}@${SSH_HOST}" "$_remote_install_cmd" >>"$LOG_FILE" 2>&1; then
-            log "Successfully installed SSH public key to Knulli host via sshpass."
-            return 0
+        if [ "$_flavor" = "openssh" ]; then
+            if SSHPASS="$SSH_PASSWORD" sshpass -e ssh -p "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout="$SSH_TIMEOUT" "${SSH_USER}@${SSH_HOST}" "$_remote_install_cmd" >>"$LOG_FILE" 2>&1; then
+                log "Successfully installed SSH public key via sshpass + OpenSSH."
+                return 0
+            fi
+        elif [ -x "$PAK_DIR/bin/dropbearmulti" ]; then
+            if SSHPASS="$SSH_PASSWORD" sshpass -e "$PAK_DIR/bin/dropbearmulti" dbclient -p "$SSH_PORT" -y -y "${SSH_USER}@${SSH_HOST}" "$_remote_install_cmd" >>"$LOG_FILE" 2>&1; then
+                log "Successfully installed SSH public key via sshpass + dropbearmulti."
+                return 0
+            fi
+        elif command -v dbclient >/dev/null 2>&1; then
+            if SSHPASS="$SSH_PASSWORD" sshpass -e dbclient -p "$SSH_PORT" -y -y "${SSH_USER}@${SSH_HOST}" "$_remote_install_cmd" >>"$LOG_FILE" 2>&1; then
+                log "Successfully installed SSH public key via sshpass + dbclient."
+                return 0
+            fi
         fi
     fi
 
-    if [ -n "$SSH_PASSWORD" ]; then
-        _askpass_script="$PAK_DIR/.ssh/askpass.sh"
-        printf "#!/bin/sh\necho '%s'\n" "$SSH_PASSWORD" > "$_askpass_script"
-        chmod 700 "$_askpass_script"
-        if DISPLAY=":0" SSH_ASKPASS="$_askpass_script" SSH_ASKPASS_REQUIRE=force setsid ssh -p "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout="$SSH_TIMEOUT" "${SSH_USER}@${SSH_HOST}" "$_remote_install_cmd" </dev/null >>"$LOG_FILE" 2>&1; then
-            rm -f "$_askpass_script"
-            log "Successfully installed SSH public key to Knulli host via SSH_ASKPASS."
-            return 0
-        fi
-        rm -f "$_askpass_script"
-    fi
-
-    log "WARNING: Could not automatically copy SSH key without sshpass/SSH_ASKPASS."
+    log "WARN: Automatic key installation failed (check password or sshpass)."
     return 1
 }
 
 init_ssh_transport() {
     mkdir -p "$(dirname "$SSH_KEY_PATH")"
-    chmod 700 "$(dirname "$SSH_KEY_PATH")"
+    chmod 700 "$(dirname "$SSH_KEY_PATH")" 2>/dev/null || true
 
-    _base_ssh_opts="-p $SSH_PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=$SSH_TIMEOUT"
+    _flavor="$(get_ssh_flavor)"
+    log "Detected SSH client flavor: $_flavor"
 
-    # 1. Check if key auth works right now
-    if [ -f "$SSH_KEY_PATH" ]; then
-        chmod 600 "$SSH_KEY_PATH" 2>/dev/null || true
-        if ssh $_base_ssh_opts -i "$SSH_KEY_PATH" -o BatchMode=yes "${SSH_USER}@${SSH_HOST}" "echo ok" >/dev/null 2>&1; then
-            SSH_CMD="ssh $_base_ssh_opts -i \"$SSH_KEY_PATH\" -o BatchMode=yes"
-            RSYNC_RSH="ssh $_base_ssh_opts -i $SSH_KEY_PATH -o BatchMode=yes"
-            log "Connected to ${SSH_HOST} using SSH key ($SSH_KEY_PATH)."
-            return 0
+    # Note: If SSH_KEY_PATH is stored on FAT32/exFAT (/mnt/SDCARD), OpenSSH rejects keys with 0777 permissions.
+    # Copy the key into /tmp (tmpfs, supports chmod 600) before passing -i to ssh!
+    _runtime_key="/tmp/savesync_id_key"
+
+    # --- Helper to test and activate key auth ---
+    try_key_auth() {
+        _cand_key="$1"
+        [ -f "$_cand_key" ] || return 1
+        cp "$_cand_key" "$_runtime_key"
+        chmod 600 "$_runtime_key" 2>/dev/null || true
+
+        if [ "$_flavor" = "openssh" ]; then
+            _opts="-p $SSH_PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=$SSH_TIMEOUT -i $_runtime_key -o BatchMode=yes"
+            if ssh $_opts "${SSH_USER}@${SSH_HOST}" "echo ok" >>"$LOG_FILE" 2>&1; then
+                SSH_CMD="ssh $_opts"
+                RSYNC_RSH="ssh $_opts"
+                log "Connected to ${SSH_HOST} using OpenSSH key auth."
+                return 0
+            fi
+        elif [ -x "$PAK_DIR/bin/dropbearmulti" ]; then
+            _opts="-p $SSH_PORT -y -y -i $_runtime_key"
+            if "$PAK_DIR/bin/dropbearmulti" dbclient $_opts "${SSH_USER}@${SSH_HOST}" "echo ok" >>"$LOG_FILE" 2>&1; then
+                SSH_CMD="\"$PAK_DIR/bin/dropbearmulti\" dbclient $_opts"
+                RSYNC_RSH="$PAK_DIR/bin/dropbearmulti dbclient $_opts"
+                log "Connected to ${SSH_HOST} using Dropbear key auth."
+                return 0
+            fi
         fi
+        return 1
+    }
+
+    # 1. Try existing key authentication first
+    if try_key_auth "$SSH_KEY_PATH" || try_key_auth "${SSH_KEY_PATH}_dropbear"; then
+        return 0
     fi
 
-    # 2. Try auto-provisioning SSH key
-    show_ui_message "Setting up SSH auth with $SSH_HOST..." 0
-    if setup_ssh_keys; then
-        if ssh $_base_ssh_opts -i "$SSH_KEY_PATH" -o BatchMode=yes "${SSH_USER}@${SSH_HOST}" "echo ok" >/dev/null 2>&1; then
-            SSH_CMD="ssh $_base_ssh_opts -i \"$SSH_KEY_PATH\" -o BatchMode=yes"
-            RSYNC_RSH="ssh $_base_ssh_opts -i $SSH_KEY_PATH -o BatchMode=yes"
-            log "Connected to ${SSH_HOST} using newly provisioned SSH key."
-            return 0
-        fi
-    fi
-
-    # 3. Fallback to sshpass directly for all operations if key auth failed
+    # 2. Try direct password authentication via bundled sshpass (Fastest & most reliable on FAT32 SD cards!)
     if command -v sshpass >/dev/null 2>&1 && [ -n "$SSH_PASSWORD" ]; then
         export SSHPASS="$SSH_PASSWORD"
-        if sshpass -e ssh $_base_ssh_opts "${SSH_USER}@${SSH_HOST}" "echo ok" >/dev/null 2>&1; then
-            SSH_CMD="sshpass -e ssh $_base_ssh_opts"
-            RSYNC_RSH="sshpass -e ssh $_base_ssh_opts"
-            log "Connected to ${SSH_HOST} using sshpass password authentication."
-            return 0
+        log "Testing sshpass password authentication to ${SSH_USER}@${SSH_HOST}:${SSH_PORT}..."
+
+        if [ "$_flavor" = "openssh" ]; then
+            _opts="-p $SSH_PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=$SSH_TIMEOUT"
+            if sshpass -e ssh $_opts "${SSH_USER}@${SSH_HOST}" "echo ok" >>"$LOG_FILE" 2>&1; then
+                # Create a clean wrapper script in /tmp so rsync -e and eval "$SSH_CMD" work seamlessly
+                _wrap="/tmp/savesync_ssh_wrap.sh"
+                cat <<EOF > "$_wrap"
+#!/bin/sh
+export SSHPASS='$SSH_PASSWORD'
+exec "$(command -v sshpass)" -e ssh $_opts "\$@"
+EOF
+                chmod 700 "$_wrap"
+                SSH_CMD="$_wrap"
+                RSYNC_RSH="$_wrap"
+                log "Connected to ${SSH_HOST} using sshpass + OpenSSH."
+                # Opportunistically install SSH key in background for future runs
+                setup_ssh_keys >/dev/null 2>&1 || true
+                return 0
+            fi
+        fi
+
+        if [ -x "$PAK_DIR/bin/dropbearmulti" ]; then
+            _opts="-p $SSH_PORT -y -y"
+            if sshpass -e "$PAK_DIR/bin/dropbearmulti" dbclient $_opts "${SSH_USER}@${SSH_HOST}" "echo ok" >>"$LOG_FILE" 2>&1; then
+                _wrap="/tmp/savesync_ssh_wrap.sh"
+                cat <<EOF > "$_wrap"
+#!/bin/sh
+export SSHPASS='$SSH_PASSWORD'
+exec "$(command -v sshpass)" -e "$PAK_DIR/bin/dropbearmulti" dbclient $_opts "\$@"
+EOF
+                chmod 700 "$_wrap"
+                SSH_CMD="$_wrap"
+                RSYNC_RSH="$_wrap"
+                log "Connected to ${SSH_HOST} using sshpass + bundled dropbearmulti (dbclient)."
+                return 0
+            fi
         fi
     fi
 
-    # 4. Fallback to SSH_ASKPASS wrapper if setsid + SSH_ASKPASS works
-    if [ -n "$SSH_PASSWORD" ]; then
-        _askpass_script="$PAK_DIR/.ssh/askpass.sh"
-        printf "#!/bin/sh\necho '%s'\n" "$SSH_PASSWORD" > "$_askpass_script"
-        chmod 700 "$_askpass_script"
-        _ssh_wrap="$PAK_DIR/.ssh/ssh_wrap.sh"
-        cat <<EOF > "$_ssh_wrap"
-#!/bin/sh
-export DISPLAY=":0"
-export SSH_ASKPASS="$_askpass_script"
-export SSH_ASKPASS_REQUIRE="force"
-exec setsid ssh $_base_ssh_opts "\$@" </dev/null
-EOF
-        chmod 700 "$_ssh_wrap"
-        if "$_ssh_wrap" "${SSH_USER}@${SSH_HOST}" "echo ok" >/dev/null 2>&1; then
-            SSH_CMD="\"$_ssh_wrap\""
-            RSYNC_RSH="$_ssh_wrap"
-            log "Connected to ${SSH_HOST} using SSH_ASKPASS wrapper."
+    # 3. Try provisioning keys and re-testing key auth
+    show_ui_message "Setting up SSH auth with $SSH_HOST..." 0
+    if setup_ssh_keys; then
+        if try_key_auth "$SSH_KEY_PATH" || try_key_auth "${SSH_KEY_PATH}_dropbear"; then
             return 0
         fi
     fi
@@ -543,60 +638,73 @@ EOF
 }
 
 # --- Remote Pull & Push Helpers (Supports Rsync OR Built-in Tar-over-SSH Fallback) ---
-# Pulls mapped system folders from Knulli into $REMOTE_STAGE
 pull_remote_saves() {
     _remote_folders="$1"
     _filter_args="$(build_rsync_filter_args)"
 
+    # Note: Knulli (Batocera) ships with `rsync`, whereas Dropbear on Knulli might or might not have rsync in default PATH.
+    # Try rsync first; if rsync fails (e.g., remote rsync missing or protocol mismatch), automatically fall back to tar-over-SSH!
     if command -v rsync >/dev/null 2>&1; then
         log "Using rsync transport to pull remote saves..."
+        _rsync_ok=0
         for _k_folder in $_remote_folders; do
             mkdir -p "$REMOTE_STAGE/$_k_folder"
             # shellcheck disable=SC2086
-            rsync -rtz --modify-window=2 $_filter_args \
+            if rsync -rtz --modify-window=2 $_filter_args \
                 -e "$RSYNC_RSH" \
                 "${SSH_USER}@${SSH_HOST}:${REMOTE_SAVES_ROOT}/${_k_folder}/" \
-                "$REMOTE_STAGE/$_k_folder/" >>"$LOG_FILE" 2>&1 || true
+                "$REMOTE_STAGE/$_k_folder/" >>"$LOG_FILE" 2>&1; then
+                _rsync_ok=1
+            fi
         done
-    else
-        log "rsync binary not present locally; using native tar-over-SSH transport to pull saves..."
-        # Create folder directories locally and stream existing remote folders via tar over SSH
-        for _k_folder in $_remote_folders; do
-            mkdir -p "$REMOTE_STAGE/$_k_folder"
-        done
-        eval "$SSH_CMD \"${SSH_USER}@${SSH_HOST}\" \"tar -cf - -C '$REMOTE_SAVES_ROOT' --ignore-failed-read --exclude='*.state*' --exclude='*.st[0-9]*' --exclude='*.auto' --exclude='*.png' --exclude='*.jpg' --exclude='*.bmp' --exclude='*.txt' --exclude='*.xml' --exclude='*.cfg' $_remote_folders 2>/dev/null || tar -cf - -C '$REMOTE_SAVES_ROOT' . 2>/dev/null\"" | tar -xf - -p -C "$REMOTE_STAGE" 2>>"$LOG_FILE" || true
+        if [ "$_rsync_ok" -eq 1 ]; then
+            return 0
+        fi
+        log "Rsync pull returned non-zero or empty; verifying with native tar-over-SSH transport..."
     fi
+
+    log "Using native tar-over-SSH transport to pull saves..."
+    for _k_folder in $_remote_folders; do
+        mkdir -p "$REMOTE_STAGE/$_k_folder"
+    done
+    eval "$SSH_CMD \"${SSH_USER}@${SSH_HOST}\" \"tar -cf - -C '$REMOTE_SAVES_ROOT' --ignore-failed-read --exclude='*.state*' --exclude='*.st[0-9]*' --exclude='*.auto' --exclude='*.png' --exclude='*.jpg' --exclude='*.bmp' --exclude='*.txt' --exclude='*.xml' --exclude='*.cfg' $_remote_folders 2>/dev/null || tar -cf - -C '$REMOTE_SAVES_ROOT' . 2>/dev/null\"" | tar -xf - -p -C "$REMOTE_STAGE" 2>>"$LOG_FILE" || true
 }
 
-# Pushes updated saves in $REMOTE_STAGE back to Knulli
 push_remote_saves() {
     _remote_folders="$1"
     _filter_args="$(build_rsync_filter_args)"
 
     if command -v rsync >/dev/null 2>&1; then
         log "Using rsync transport to push updated saves..."
+        _push_failed=0
         for _k_folder in $_remote_folders; do
             if [ -d "$REMOTE_STAGE/$_k_folder" ] && [ -n "$(ls -A "$REMOTE_STAGE/$_k_folder" 2>/dev/null)" ]; then
                 # shellcheck disable=SC2086
-                rsync -rtz --modify-window=2 -u $_filter_args \
+                if ! rsync -rtz --modify-window=2 -u $_filter_args \
                     -e "$RSYNC_RSH" \
                     "$REMOTE_STAGE/$_k_folder/" \
-                    "${SSH_USER}@${SSH_HOST}:${REMOTE_SAVES_ROOT}/${_k_folder}/" >>"$LOG_FILE" 2>&1
+                    "${SSH_USER}@${SSH_HOST}:${REMOTE_SAVES_ROOT}/${_k_folder}/" >>"$LOG_FILE" 2>&1; then
+                    _push_failed=1
+                fi
             fi
         done
-    else
-        log "rsync binary not present locally; using native tar-over-SSH transport to push saves..."
-        _dirs_to_push=""
-        for _k_folder in $_remote_folders; do
-            if [ -d "$REMOTE_STAGE/$_k_folder" ] && [ -n "$(ls -A "$REMOTE_STAGE/$_k_folder" 2>/dev/null)" ]; then
-                _dirs_to_push="$_dirs_to_push $_k_folder"
-            fi
-        done
-        if [ -n "$_dirs_to_push" ]; then
-            # shellcheck disable=SC2086
-            tar -cf - -C "$REMOTE_STAGE" $_dirs_to_push 2>>"$LOG_FILE" | \
-                eval "$SSH_CMD \"${SSH_USER}@${SSH_HOST}\" \"mkdir -p '$REMOTE_SAVES_ROOT' && tar -xf - -p -C '$REMOTE_SAVES_ROOT'\"" >>"$LOG_FILE" 2>&1
+        if [ "$_push_failed" -eq 0 ]; then
+            return 0
         fi
+        log "Rsync push encountered an error; falling back to native tar-over-SSH push..."
+    fi
+
+    log "Using native tar-over-SSH transport to push saves..."
+    _dirs_to_push=""
+    for _k_folder in $_remote_folders; do
+        if [ -d "$REMOTE_STAGE/$_k_folder" ] && [ -n "$(ls -A "$REMOTE_STAGE/$_k_folder" 2>/dev/null)" ]; then
+            _dirs_to_push="$_dirs_to_push $_k_folder"
+        fi
+    done
+    if [ -n "$_dirs_to_push" ]; then
+        # shellcheck disable=SC2086
+        tar -cf - -C "$REMOTE_STAGE" $_dirs_to_push 2>>"$LOG_FILE" | \
+            eval "$SSH_CMD \"${SSH_USER}@${SSH_HOST}\" \"mkdir -p '$REMOTE_SAVES_ROOT' && tar -xf - -p -C '$REMOTE_SAVES_ROOT'\"" >>"$LOG_FILE" 2>&1
     fi
 }
 
@@ -718,7 +826,7 @@ run_sync() {
 
     show_ui_message "Connecting to $SSH_HOST..." 0
     if ! init_ssh_transport; then
-        show_ui_message "Failed to connect to $SSH_HOST! Check IP/User/Pass." 4
+        show_ui_message "Failed to connect to $SSH_HOST! Opening Debug Log..." 3
         return 1
     fi
 
@@ -938,11 +1046,12 @@ case "$EFFECTIVE_MODE" in
         run_interactive_menu
         ;;
     setup-auth)
-        run_sync "setup-auth"
+        run_connection_diagnostics
         ;;
     sync|auto|*)
         if ! run_sync "sync"; then
             if [ -n "$LIST_BIN" ]; then
+                view_debug_logs
                 run_interactive_menu
             else
                 exit 1

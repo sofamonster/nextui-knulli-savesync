@@ -35,7 +35,7 @@ MOCK_BIN="$TEST_SANDBOX/mock_bin"
 mkdir -p "$SDCARD_MOCK/Tools/tg5040"
 cp -r "$PAK_SRC" "$SDCARD_MOCK/Tools/tg5040/SaveSync.pak"
 TEST_PAK="$SDCARD_MOCK/Tools/tg5040/SaveSync.pak"
-rm -f "$TEST_PAK/bin/rsync" "$TEST_PAK/bin/minui-list" "$TEST_PAK/bin/minui-keyboard" "$TEST_PAK/bin/minui-presenter"
+rm -f "$TEST_PAK/bin"/*
 
 mkdir -p "$SDCARD_MOCK/Saves/GBA" \
          "$SDCARD_MOCK/Saves/SFC" \
