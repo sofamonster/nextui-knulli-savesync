@@ -1,0 +1,6 @@
+# Ignore generated SSH keys, askpass wrappers, and runtime logs
+Tools/tg5040/SaveSync.pak/.ssh/
+Tools/tg5040/SaveSync.pak/savesync.log
+*.tmp
+*.bak
+.DS_Store
