@@ -39,7 +39,7 @@ load_config() {
     BACKUP_DIR="${BACKUP_DIR:-$SDCARD_PATH/Backups/SaveSync}"
     BACKUP_KEEP_COUNT="${BACKUP_KEEP_COUNT:-3}"
     BACKUP_REMOTE="${BACKUP_REMOTE:-true}"
-    ALLOWED_SAVE_EXTS="${ALLOWED_SAVE_EXTS:-sav srm rtc eep fla sra mcr mcd dsv ngf}"
+    ALLOWED_SAVE_EXTS="${ALLOWED_SAVE_EXTS:-sav srm rtc eep fla sra mcr mcd dsv ngf flash}"
 }
 
 load_config
