@@ -2,6 +2,10 @@
 
 A self-contained **NextUI Tool Pak (`SaveSync.pak`)** for the **TrimUI Brick (`tg5040`)** that bidirectionally synchronizes **real in-game save files** with an **Anbernic RG28XX running Knulli** over Wi-Fi using `rsync` and `ssh`, complete with an **on-device interactive UI and on-screen keyboard**.
 
+
+> [!WARNING]
+> WARNING - Tool build for myself has not seen wider testing, use at own risk. Works flawlessly for my devices primary used for GBA, PSX and NGPC save synchronisation.
+
 ---
 
 ## Key Features
