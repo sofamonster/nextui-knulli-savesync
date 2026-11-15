@@ -62,18 +62,35 @@ save_config_value() {
     sync
 }
 
-# Optional CLI flags for automated testing (--sync, --menu, --setup-auth)
+# Optional CLI flags for automated testing (--sync, --menu, --setup-auth, --restore <ts>, --restore-mode <mode>)
 CLI_MODE="menu"
-for arg in "$@"; do
-    case "$arg" in
+RESTORE_TS=""
+RESTORE_MODE="both"
+while [ "$#" -gt 0 ]; do
+    case "$1" in
         --sync)
             CLI_MODE="sync"
+            shift
             ;;
         --menu|--ui)
             CLI_MODE="menu"
+            shift
             ;;
         --setup-auth)
             CLI_MODE="setup-auth"
+            shift
+            ;;
+        --restore)
+            CLI_MODE="restore"
+            RESTORE_TS="${2:-latest}"
+            shift 2 2>/dev/null || shift
+            ;;
+        --restore-mode)
+            RESTORE_MODE="${2:-both}"
+            shift 2 2>/dev/null || shift
+            ;;
+        *)
+            shift
             ;;
     esac
 done
@@ -358,6 +375,7 @@ run_interactive_menu() {
 
         cat <<EOF > "$_menu_file"
 Sync Saves Now ($SSH_HOST)
+Restore from Backup
 RG28XX IP / Host: $SSH_HOST
 SSH Port: $SSH_PORT
 SSH Username: $SSH_USER
@@ -390,6 +408,9 @@ EOF
                 if ! run_sync "sync"; then
                     view_debug_logs
                 fi
+                ;;
+            "Restore from Backup"*)
+                run_restore_menu
                 ;;
             "RG28XX IP / Host:"*)
                 if _new_host="$(prompt_keyboard "RG28XX IP or Hostname" "$SSH_HOST")"; then
@@ -789,7 +810,7 @@ push_remote_saves() {
                 if [ -d "$REMOTE_STAGE/$_k_folder" ] && [ -n "$(ls -A "$REMOTE_STAGE/$_k_folder" 2>/dev/null)" ]; then
                     run_remote_cmd "mkdir -p '${REMOTE_SAVES_ROOT}/${_k_folder}'" >>"$LOG_FILE" 2>&1 || true
                     # shellcheck disable=SC2086
-                    rsync -rtz --no-perms --no-owner --no-group --modify-window=2 -u $_filter_args \
+                    rsync -rtz --no-perms --no-owner --no-group --modify-window=2 $_filter_args \
                         -e "$SSH_PIPE_WRAP" \
                         "$REMOTE_STAGE/$_k_folder/" \
                         "${SSH_USER}@${SSH_HOST}:${REMOTE_SAVES_ROOT}/${_k_folder}/" >>"$LOG_FILE" 2>&1
@@ -1146,10 +1167,426 @@ resolve_new_local_save_path() {
     echo "$LOCAL_SAVES_ROOT/$_fallback_n_dir/${_game_base}${_fallback_n_suf}"
 }
 
+# --- Backup Listing & Restore Engine (Overwrite Both Devices) ---
+list_backup_timestamps() {
+    if [ ! -d "$BACKUP_DIR" ]; then
+        return 0
+    fi
+    for _f in "$BACKUP_DIR"/local_*.tar.gz "$BACKUP_DIR"/remote_*.tar.gz; do
+        [ -f "$_f" ] || continue
+        _b="$(basename "$_f")"
+        _ts="${_b#local_}"
+        _ts="${_ts#remote_}"
+        _ts="${_ts%.tar.gz}"
+        echo "$_ts"
+    done | sort -r -u
+}
+
+format_backup_ts() {
+    _raw="$1"
+    echo "$_raw" | sed 's/^\([0-9]\{4\}\)\([0-9]\{2\}\)\([0-9]\{2\}\)_\([0-9]\{2\}\)\([0-9]\{2\}\)\([0-9]\{2\}\)$/\1-\2-\3 \4:\5:\6/'
+}
+
+get_mapped_remote_folders() {
+    _folders=""
+    for _cfg in "$OVERRIDES_FILE" "$MAPPINGS_FILE"; do
+        [ -f "$_cfg" ] || continue
+        while IFS='|' read -r _f_nextui _f_knulli _s_nextui _s_knulli || [ -n "$_f_nextui" ]; do
+            _f_nextui="$(trim "$_f_nextui")"
+            case "$_f_nextui" in ""|\#*) continue ;; esac
+            _f_knulli="$(trim "$_f_knulli")"
+            if [ -n "$_f_knulli" ]; then
+                case " $_folders " in
+                    *" $_f_knulli "*) ;;
+                    *) _folders="$_folders $_f_knulli" ;;
+                esac
+            fi
+        done < "$_cfg"
+    done
+    echo "$_folders"
+}
+
+clean_local_allowed_saves() {
+    if [ -d "$LOCAL_SAVES_ROOT" ]; then
+        find "$LOCAL_SAVES_ROOT" -type f | while IFS= read -r _lf; do
+            if is_allowed_save_file "$(basename "$_lf")"; then
+                rm -f "$_lf"
+            fi
+        done
+    fi
+}
+
+clean_remote_allowed_saves() {
+    _rem_folders="$1"
+    _ext_expr=""
+    for _ext in $ALLOWED_SAVE_EXTS; do
+        if [ -z "$_ext_expr" ]; then
+            _ext_expr="-name '*.${_ext}'"
+        else
+            _ext_expr="$_ext_expr -o -name '*.${_ext}'"
+        fi
+    done
+    _remote_clean_cmd="cd '$REMOTE_SAVES_ROOT' 2>/dev/null || exit 0; for d in $_rem_folders; do [ -d \"\$d\" ] && find \"\$d\" -type f \\( $_ext_expr \\) -exec rm -f {} \\; 2>/dev/null; done; true"
+    run_remote_cmd "$_remote_clean_cmd" >>"$LOG_FILE" 2>&1 || true
+}
+
+map_local_stage_to_remote_stage() {
+    _src_local_root="$1"
+    _dst_remote_root="$2"
+    _done_keys="$STAGE_DIR/restore_mapped_loc.txt"
+    : > "$_done_keys"
+
+    if [ -f "$OVERRIDES_FILE" ]; then
+        while IFS='|' read -r _n_dir _k_dir _n_file _k_file || [ -n "$_n_dir" ]; do
+            _n_dir="$(trim "$_n_dir")"
+            case "$_n_dir" in ""|\#*) continue ;; esac
+            _k_dir="$(trim "$_k_dir")"
+            _n_file="$(trim "$_n_file")"
+            _k_file="$(trim "$_k_file")"
+
+            _loc_p="$_src_local_root/$_n_dir/$_n_file"
+            _rem_p="$_dst_remote_root/$_k_dir/$_k_file"
+            if [ -f "$_loc_p" ]; then
+                copy_save_with_mtime "$_loc_p" "$_rem_p"
+                echo "LOC:$_loc_p" >> "$_done_keys"
+            fi
+        done < "$OVERRIDES_FILE"
+    fi
+
+    if [ -f "$MAPPINGS_FILE" ]; then
+        while IFS='|' read -r _n_dir _k_dir _n_suf _k_suf || [ -n "$_n_dir" ]; do
+            _n_dir="$(trim "$_n_dir")"
+            case "$_n_dir" in ""|\#*) continue ;; esac
+            _k_dir="$(trim "$_k_dir")"
+            _n_suf="$(trim "$_n_suf")"
+            _k_suf="$(trim "$_k_suf")"
+
+            _loc_sys="$_src_local_root/$_n_dir"
+            _rem_sys="$_dst_remote_root/$_k_dir"
+            if [ -d "$_loc_sys" ]; then
+                for _loc_f in "$_loc_sys"/*; do
+                    [ -f "$_loc_f" ] || continue
+                    _bname="$(basename "$_loc_f")"
+                    is_allowed_save_file "$_bname" || continue
+                    grep -qF "LOC:$_loc_f" "$_done_keys" 2>/dev/null && continue
+                    case "$_bname" in
+                        *"$_n_suf")
+                            _game_base="${_bname%"$_n_suf"}"
+                            [ -n "$_game_base" ] || continue
+                            copy_save_with_mtime "$_loc_f" "$_rem_sys/${_game_base}${_k_suf}"
+                            echo "LOC:$_loc_f" >> "$_done_keys"
+                            ;;
+                    esac
+                done
+            fi
+        done < "$MAPPINGS_FILE"
+    fi
+}
+
+map_remote_stage_to_local_stage() {
+    _src_remote_root="$1"
+    _dst_local_root="$2"
+    _done_keys="$STAGE_DIR/restore_mapped_rem.txt"
+    : > "$_done_keys"
+
+    if [ -f "$OVERRIDES_FILE" ]; then
+        while IFS='|' read -r _n_dir _k_dir _n_file _k_file || [ -n "$_n_dir" ]; do
+            _n_dir="$(trim "$_n_dir")"
+            case "$_n_dir" in ""|\#*) continue ;; esac
+            _k_dir="$(trim "$_k_dir")"
+            _n_file="$(trim "$_n_file")"
+            _k_file="$(trim "$_k_file")"
+
+            _loc_p="$_dst_local_root/$_n_dir/$_n_file"
+            _rem_p="$_src_remote_root/$_k_dir/$_k_file"
+            if [ -f "$_rem_p" ]; then
+                copy_save_with_mtime "$_rem_p" "$_loc_p"
+                echo "REM:$_rem_p" >> "$_done_keys"
+            fi
+        done < "$OVERRIDES_FILE"
+    fi
+
+    if [ -f "$MAPPINGS_FILE" ]; then
+        while IFS='|' read -r _n_dir _k_dir _n_suf _k_suf || [ -n "$_n_dir" ]; do
+            _n_dir="$(trim "$_n_dir")"
+            case "$_n_dir" in ""|\#*) continue ;; esac
+            _k_dir="$(trim "$_k_dir")"
+            _n_suf="$(trim "$_n_suf")"
+            _k_suf="$(trim "$_k_suf")"
+
+            _rem_sys="$_src_remote_root/$_k_dir"
+            if [ -d "$_rem_sys" ]; then
+                for _rem_f in "$_rem_sys"/*; do
+                    [ -f "$_rem_f" ] || continue
+                    _bname="$(basename "$_rem_f")"
+                    is_allowed_save_file "$_bname" || continue
+                    grep -qF "REM:$_rem_f" "$_done_keys" 2>/dev/null && continue
+                    case "$_bname" in
+                        *"$_k_suf")
+                            _game_base="${_bname%"$_k_suf"}"
+                            [ -n "$_game_base" ] || continue
+                            _existing_loc="$(find_existing_local_save "$_k_dir" "$_game_base" "$_k_suf")"
+                            if [ -n "$_existing_loc" ]; then
+                                _rel_loc="${_existing_loc#"$LOCAL_SAVES_ROOT"/}"
+                                _target_loc="$_dst_local_root/$_rel_loc"
+                            else
+                                _best_loc="$(resolve_new_local_save_path "$_k_dir" "$_game_base" "$_k_suf" "$_n_dir" "$_n_suf")"
+                                _rel_loc="${_best_loc#"$LOCAL_SAVES_ROOT"/}"
+                                _target_loc="$_dst_local_root/$_rel_loc"
+                            fi
+                            copy_save_with_mtime "$_rem_f" "$_target_loc"
+                            echo "REM:$_rem_f" >> "$_done_keys"
+                            ;;
+                    esac
+                done
+            fi
+        done < "$MAPPINGS_FILE"
+    fi
+}
+
+restore_backup() {
+    _req_ts="${1:-latest}"
+    _mode="${2:-both}"
+    load_config
+    ensure_binaries
+
+    if [ "$_req_ts" = "latest" ] || [ -z "$_req_ts" ]; then
+        _req_ts="$(list_backup_timestamps | head -n 1)"
+    fi
+
+    if [ -z "$_req_ts" ]; then
+        show_ui_message "No backups found to restore!" 3
+        log "ERROR: No backup timestamps found in $BACKUP_DIR"
+        return 1
+    fi
+
+    _loc_tar="$BACKUP_DIR/local_${_req_ts}.tar.gz"
+    _rem_tar="$BACKUP_DIR/remote_${_req_ts}.tar.gz"
+    _pretty_ts="$(format_backup_ts "$_req_ts")"
+
+    if [ ! -f "$_loc_tar" ] && [ ! -f "$_rem_tar" ]; then
+        show_ui_message "Backup $_pretty_ts not found!" 3
+        log "ERROR: Backup archives missing for $_req_ts"
+        return 1
+    fi
+
+    log "=== RESTORING BACKUP $_req_ts (mode=$_mode) ==="
+    show_ui_message "Connecting to $SSH_HOST for restore..." 0
+    if ! init_ssh_transport; then
+        show_ui_message "Failed to connect to $SSH_HOST! Opening Debug Log..." 3
+        return 1
+    fi
+
+    STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/savesync_restore.XXXXXX")"
+    RESTORE_LOC_STAGE="$STAGE_DIR/local_saves"
+    REMOTE_STAGE="$STAGE_DIR/remote_saves"
+    mkdir -p "$RESTORE_LOC_STAGE" "$REMOTE_STAGE" "$LOCAL_SAVES_ROOT"
+
+    show_ui_message "Unpacking backup ($_pretty_ts)..." 0
+    case "$_mode" in
+        local)
+            if [ ! -f "$_loc_tar" ]; then
+                log "ERROR: Local backup missing: $_loc_tar"
+                rm -rf "$STAGE_DIR"; STAGE_DIR=""
+                show_ui_message "Local backup archive missing!" 3
+                return 1
+            fi
+            tar -xzf "$_loc_tar" -C "$RESTORE_LOC_STAGE" 2>>"$LOG_FILE"
+            map_local_stage_to_remote_stage "$RESTORE_LOC_STAGE" "$REMOTE_STAGE"
+            ;;
+        remote)
+            if [ ! -f "$_rem_tar" ]; then
+                log "ERROR: Remote backup missing: $_rem_tar"
+                rm -rf "$STAGE_DIR"; STAGE_DIR=""
+                show_ui_message "Remote backup archive missing!" 3
+                return 1
+            fi
+            tar -xzf "$_rem_tar" -C "$REMOTE_STAGE" 2>>"$LOG_FILE"
+            map_remote_stage_to_local_stage "$REMOTE_STAGE" "$RESTORE_LOC_STAGE"
+            ;;
+        both|*)
+            if [ -f "$_loc_tar" ]; then
+                tar -xzf "$_loc_tar" -C "$RESTORE_LOC_STAGE" 2>>"$LOG_FILE"
+            fi
+            if [ -f "$_rem_tar" ]; then
+                tar -xzf "$_rem_tar" -C "$REMOTE_STAGE" 2>>"$LOG_FILE"
+            fi
+            if [ -f "$_loc_tar" ] && [ ! -f "$_rem_tar" ]; then
+                map_local_stage_to_remote_stage "$RESTORE_LOC_STAGE" "$REMOTE_STAGE"
+            elif [ ! -f "$_loc_tar" ] && [ -f "$_rem_tar" ]; then
+                map_remote_stage_to_local_stage "$REMOTE_STAGE" "$RESTORE_LOC_STAGE"
+            fi
+            ;;
+    esac
+
+    # Strip any non-allowed save files from both staging trees
+    for _tree in "$RESTORE_LOC_STAGE" "$REMOTE_STAGE"; do
+        find "$_tree" -type f | while IFS= read -r _f; do
+            if ! is_allowed_save_file "$(basename "$_f")"; then
+                rm -f "$_f"
+            fi
+        done
+    done
+
+    _remote_folders="$(get_mapped_remote_folders)"
+
+    show_ui_message "Overwriting TrimUI saves ($_pretty_ts)..." 0
+    log "Restoring local saves to $LOCAL_SAVES_ROOT..."
+    clean_local_allowed_saves
+    if [ -d "$RESTORE_LOC_STAGE" ]; then
+        find "$RESTORE_LOC_STAGE" -type f | while IFS= read -r _f; do
+            _rel="${_f#"$RESTORE_LOC_STAGE"/}"
+            copy_save_with_mtime "$_f" "$LOCAL_SAVES_ROOT/$_rel"
+        done
+    fi
+    _loc_restored="$(find "$LOCAL_SAVES_ROOT" -type f 2>/dev/null | wc -l | tr -d ' ')"
+    log "Restored local save file(s) on TrimUI (total files: $_loc_restored)."
+
+    show_ui_message "Overwriting Knulli saves ($SSH_HOST)..." 0
+    log "Restoring remote saves to ${SSH_HOST}:${REMOTE_SAVES_ROOT}..."
+    run_remote_cmd "mkdir -p '$REMOTE_SAVES_ROOT'" >>"$LOG_FILE" 2>&1 || true
+    clean_remote_allowed_saves "$_remote_folders"
+
+    if ! push_remote_saves "$_remote_folders"; then
+        rm -rf "$STAGE_DIR"
+        STAGE_DIR=""
+        show_ui_message "Remote restore failed! Opening Debug Log..." 3
+        return 1
+    fi
+
+    rm -rf "$STAGE_DIR"
+    STAGE_DIR=""
+    sync
+    _msg="Restored Backup $_pretty_ts to Both Devices!"
+    show_ui_message "$_msg" 3
+    log "=== $_msg ==="
+    return 0
+}
+
+run_restore_menu() {
+    dismiss_ui_message
+    _timestamps="$(list_backup_timestamps)"
+
+    if [ -z "$_timestamps" ]; then
+        show_ui_message "No backups found in Backups/SaveSync!" 3
+        return 0
+    fi
+
+    while true; do
+        _bmenu="$(mktemp "${TMPDIR:-/tmp}/savesync_bmenu.XXXXXX")"
+        _bchoice="$(mktemp "${TMPDIR:-/tmp}/savesync_bchoice.XXXXXX")"
+        : > "$_bmenu"
+
+        for _ts in $_timestamps; do
+            _has_loc=0
+            _has_rem=0
+            [ -f "$BACKUP_DIR/local_${_ts}.tar.gz" ] && _has_loc=1
+            [ -f "$BACKUP_DIR/remote_${_ts}.tar.gz" ] && _has_rem=1
+
+            if [ "$_has_loc" -eq 1 ] && [ "$_has_rem" -eq 1 ]; then
+                _tag="Local+Remote"
+            elif [ "$_has_loc" -eq 1 ]; then
+                _tag="Local Only"
+            else
+                _tag="Remote Only"
+            fi
+            _pretty="$(format_backup_ts "$_ts")"
+            echo "$_pretty ($_tag) [$_ts]" >> "$_bmenu"
+        done
+        echo "Back" >> "$_bmenu"
+
+        "$LIST_BIN" \
+            --file "$_bmenu" \
+            --format text \
+            --scroll-method wrap \
+            --title "Select Backup to Restore (A: Select | B: Back)" \
+            --write-location "$_bchoice" >/dev/null 2>&1
+        _rc=$?
+
+        _sel="$(cat "$_bchoice" 2>/dev/null | head -n 1 | tr -d '\r\n')"
+        rm -f "$_bmenu" "$_bchoice"
+
+        if [ "$_rc" -ne 0 ] || [ -z "$_sel" ] || [ "$_sel" = "Back" ]; then
+            return 0
+        fi
+
+        _chosen_ts="$(echo "$_sel" | sed -n 's/.*\[\([0-9_]*\)\]$/\1/p')"
+        if [ -z "$_chosen_ts" ]; then
+            return 0
+        fi
+
+        _pretty_chosen="$(format_backup_ts "$_chosen_ts")"
+        _cmenu="$(mktemp "${TMPDIR:-/tmp}/savesync_cmenu.XXXXXX")"
+        _cchoice="$(mktemp "${TMPDIR:-/tmp}/savesync_cchoice.XXXXXX")"
+
+        _has_loc=0
+        _has_rem=0
+        [ -f "$BACKUP_DIR/local_${_chosen_ts}.tar.gz" ] && _has_loc=1
+        [ -f "$BACKUP_DIR/remote_${_chosen_ts}.tar.gz" ] && _has_rem=1
+
+        if [ "$_has_loc" -eq 1 ] && [ "$_has_rem" -eq 1 ]; then
+            cat <<EOF > "$_cmenu"
+Confirm: Restore Both (Local & Remote)
+Use Local Backup for Both Devices
+Use Remote Backup for Both Devices
+Cancel
+EOF
+        elif [ "$_has_loc" -eq 1 ]; then
+            cat <<EOF > "$_cmenu"
+Confirm: Restore Local Backup to Both Devices
+Cancel
+EOF
+        else
+            cat <<EOF > "$_cmenu"
+Confirm: Restore Remote Backup to Both Devices
+Cancel
+EOF
+        fi
+
+        "$LIST_BIN" \
+            --file "$_cmenu" \
+            --format text \
+            --scroll-method wrap \
+            --title "Overwrite Both Devices ($_pretty_chosen)?" \
+            --write-location "$_cchoice" >/dev/null 2>&1
+        _crc=$?
+
+        _csel="$(cat "$_cchoice" 2>/dev/null | head -n 1 | tr -d '\r\n')"
+        rm -f "$_cmenu" "$_cchoice"
+
+        if [ "$_crc" -ne 0 ] || [ -z "$_csel" ] || [ "$_csel" = "Cancel" ]; then
+            continue
+        fi
+
+        _rmode="both"
+        case "$_csel" in
+            "Confirm: Restore Both"*)
+                _rmode="both"
+                ;;
+            *"Local Backup"*)
+                _rmode="local"
+                ;;
+            *"Remote Backup"*)
+                _rmode="remote"
+                ;;
+        esac
+
+        if restore_backup "$_chosen_ts" "$_rmode"; then
+            return 0
+        else
+            view_debug_logs
+            return 1
+        fi
+    done
+}
+
 # --- Main Entrypoint (Always opens interactive menu unless CLI flag passed) ---
 case "$CLI_MODE" in
     sync)
         run_sync "sync"
+        ;;
+    restore)
+        restore_backup "$RESTORE_TS" "$RESTORE_MODE"
         ;;
     setup-auth)
         run_connection_diagnostics

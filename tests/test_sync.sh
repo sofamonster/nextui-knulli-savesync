@@ -267,4 +267,27 @@ if [ "$LOCAL_BACKUP_COUNT" -ne 3 ] || [ "$REMOTE_BACKUP_COUNT" -ne 3 ]; then
 fi
 echo "[PASS] Verified rolling backup rotation keeps exactly 3 local and 3 remote .tar.gz archives!"
 
+echo "=== Testing Restore from Backup (Overwriting Both Devices to Older State) ==="
+# Pick the oldest of the 3 rolling backups (taken before Castlevania/FF3 were modified further)
+OLDEST_TS="$(ls -1 "$SDCARD_MOCK/Backups/SaveSync/local_"*.tar.gz | head -n 1 | sed 's/.*local_//; s/\.tar\.gz//')"
+echo "Selected backup timestamp to restore: $OLDEST_TS"
+
+# Corrupt/modify current saves on both devices AND add a post-backup save file
+echo "corrupted_metroid_save" > "$SDCARD_MOCK/Saves/GBA/Metroid Fusion.gba.sav"
+echo "corrupted_metroid_remote" > "$REMOTE_MOCK/gba/Metroid Fusion.srm"
+echo "post_backup_new_game" > "$SDCARD_MOCK/Saves/GBA/NewPostBackupGame.gba.sav"
+echo "post_backup_new_remote" > "$REMOTE_MOCK/gba/NewPostBackupGame.srm"
+
+# Restore the backup across both devices
+PATH="$NO_RSYNC_BIN" SDCARD_PATH="$SDCARD_MOCK" "$TEST_PAK/launch.sh" --restore "$OLDEST_TS" --restore-mode both
+
+# Verify both devices were rolled back to the backup state and post-backup saves were cleaned
+assert_file_content "$SDCARD_MOCK/Saves/GBA/Metroid Fusion.gba.sav" "metroid_save_v1"
+assert_file_content "$REMOTE_MOCK/gba/Metroid Fusion.srm" "metroid_save_v1"
+assert_file_missing "$SDCARD_MOCK/Saves/GBA/NewPostBackupGame.gba.sav"
+assert_file_missing "$REMOTE_MOCK/gba/NewPostBackupGame.srm"
+# Verify save states on both devices were NOT deleted during restore
+assert_file_content "$SDCARD_MOCK/Saves/GBA/Metroid Fusion.st0" "local_state"
+assert_file_content "$REMOTE_MOCK/gba/Metroid Fusion.state" "state_data"
+
 echo "=== ALL SAVESYNC TESTS PASSED SUCCESSFULLY ==="

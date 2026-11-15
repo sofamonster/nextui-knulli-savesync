@@ -69,20 +69,27 @@ Copy the `Tools/tg5040/SaveSync.pak` folder onto your TrimUI Brick MicroSD card 
 2. Turn on your **TrimUI Brick (NextUI)**, navigate to **Tools -> SaveSync (Knulli)**, and press **A**.
 3. Use the on-screen menu to configure or run:
    - **Sync Saves Now (`<Host>`)**: Runs the backup and bidirectional save synchronization.
-   - **View Debug Log (Last Run)**: Inspects the latest sync log with wrapped lines (`Up`/`Down` to scroll, `A` for small-font full-screen view, `X` to clear log, `B` to go back).
+   - **Restore from Backup**: Pick any of the rolling 3-run compressed backups (`YYYY-MM-DD HH:MM:SS`) to overwrite saves on **both** devices (TrimUI Brick + Knulli RG28XX) and roll back to that older state. You can choose to restore the paired backup (`Local & Remote`), apply the `Local Backup` to both devices, or apply the `Remote Backup` to both devices.
    - **RG28XX IP / Host**: Opens the on-screen keyboard to enter your RG28XX IP address (e.g. `192.168.1.50` or `KNULLI.local`).
    - **SSH Port**: Opens the on-screen keyboard to edit the SSH port (default `22`).
    - **SSH Username**: Opens the on-screen keyboard to edit the SSH username (default `root`).
    - **SSH Password**: Opens the on-screen keyboard to edit the SSH password (default `linux`).
-   - **Test & Setup SSH Key Auth**: Tests the SSH connection and installs the passwordless SSH key on your RG28XX.
-   - **Reset / Re-pair SSH Key on Knulli**: Clears cached local keys and reprovisions fresh SSH key authentication on your RG28XX.
+   - **Test Connection & Diagnose**: Runs step-by-step Wi-Fi/SSH diagnostics and displays the results.
+   - **Reset & Re-install SSH Keys**: Clears cached local/remote keys and reprovisions fresh SSH key authentication on your RG28XX.
+   - **View Debug Log (`savesync.log`)**: Inspects the latest sync log with wrapped lines (`Up`/`Down` to scroll, `A` for small-font full-screen view, `B` to go back).
    - **Backup Remote Saves (`true` / `false`)**: Toggle whether Knulli remote saves are backed up alongside local NextUI saves.
 
 ---
 
 ## Restoring from a Backup
+You can restore any of the last 3 backups directly from the TrimUI Brick screen:
+1. Open **SaveSync** and select **Restore from Backup**.
+2. Pick the backup timestamp you want to roll back to (`YYYY-MM-DD HH:MM:SS`).
+3. Choose how to apply the backup across both devices:
+   - **Confirm: Restore Both (Local & Remote)**: Restores `local_<timestamp>.tar.gz` to your TrimUI Brick and `remote_<timestamp>.tar.gz` to your Knulli RG28XX.
+   - **Use Local Backup for Both Devices**: Overwrites both TrimUI and Knulli (with automatic folder/extension mapping) using the `local_<timestamp>.tar.gz` snapshot.
+   - **Use Remote Backup for Both Devices**: Overwrites both Knulli and TrimUI (with automatic folder/extension mapping) using the `remote_<timestamp>.tar.gz` snapshot.
+
 Backups are stored on your TrimUI Brick SD card at:
 - `/Backups/SaveSync/local_<timestamp>.tar.gz` (NextUI `/Saves/` structure)
 - `/Backups/SaveSync/remote_<timestamp>.tar.gz` (Knulli `/userdata/saves/` structure)
-
-To restore a backup, simply extract the desired `.tar.gz` archive back into `/Saves/` on your TrimUI SD card or `/userdata/saves/` on your RG28XX.
