@@ -226,9 +226,10 @@ mask_password() {
 }
 
 # Readable on-device Debug Log viewer:
+# - Shows the last sync's "SYNCED FILES & WINNER" summary right at the top
 # - Wraps long log lines into 42-char chunks so nothing is cut off by the large list font
 # - Enables horizontal marquee scrolling (`--scroll-method wrap`) in minui-list
-# - Pressing A on any line opens the full multi-line log in a small-font (16pt) presenter view!
+# - Pressing A opens a paginated small-font (16pt) full-screen view (A: Next Page, B: Back)
 view_debug_logs() {
     dismiss_ui_message
 
@@ -237,30 +238,39 @@ view_debug_logs() {
         return 0
     fi
 
+    SUMMARY_FILE="$PAK_DIR/last_sync_summary.txt"
+
     while true; do
+        _raw_combined="$(mktemp "${TMPDIR:-/tmp}/savesync_lograw.XXXXXX")"
         _log_view="$(mktemp "${TMPDIR:-/tmp}/savesync_logview.XXXXXX")"
         _sel_out="$(mktemp "${TMPDIR:-/tmp}/savesync_logout.XXXXXX")"
+        : > "$_raw_combined"
+
+        if [ -s "$SUMMARY_FILE" ]; then
+            cat "$SUMMARY_FILE" >> "$_raw_combined"
+            echo "--------------------------------------------" >> "$_raw_combined"
+        fi
 
         if [ -s "$LOG_FILE" ]; then
-            # Reverse order (newest entries at top) and wrap long lines at 42 chars with indentation
+            grep -v "^dbclient: Caution" "$LOG_FILE" | grep -v "^[[:space:]]*$" >> "$_raw_combined" || true
+        fi
+
+        if [ -s "$_raw_combined" ]; then
             awk '
-                { lines[NR] = $0 }
-                END {
-                    for (i = NR; i >= 1; i--) {
-                        s = lines[i]
-                        if (length(s) <= 44) {
-                            print s
-                        } else {
-                            print substr(s, 1, 44)
-                            rest = substr(s, 45)
-                            while (length(rest) > 0) {
-                                print "  " substr(rest, 1, 42)
-                                rest = substr(rest, 43)
-                            }
+                {
+                    s = $0
+                    if (length(s) <= 44) {
+                        print s
+                    } else {
+                        print substr(s, 1, 44)
+                        rest = substr(s, 45)
+                        while (length(rest) > 0) {
+                            print "  " substr(rest, 1, 42)
+                            rest = substr(rest, 43)
                         }
                     }
                 }
-            ' "$LOG_FILE" > "$_log_view"
+            ' "$_raw_combined" > "$_log_view"
         else
             echo "No log entries yet." > "$_log_view"
         fi
@@ -274,18 +284,48 @@ view_debug_logs() {
         _rc=$?
         rm -f "$_log_view" "$_sel_out"
 
-        # If user pressed A (rc=0) and minui-presenter is available, show small-font full screen page
-        if [ "$_rc" -eq 0 ] && [ -n "$PRESENTER_BIN" ] && [ -s "$LOG_FILE" ]; then
-            _page_txt="$(tail -n 16 "$LOG_FILE" | fold -s -w 58)"
-            "$PRESENTER_BIN" \
-                --message "$_page_txt" \
-                --font-size-default 16 \
-                --message-alignment top \
-                --cancel-show \
-                --cancel-button B \
-                --cancel-text "BACK" \
-                --timeout 0 >/dev/null 2>&1 || true
+        # If user pressed A (rc=0) and minui-presenter is available, show paginated small-font (16pt) view
+        if [ "$_rc" -eq 0 ] && [ -n "$PRESENTER_BIN" ] && [ -s "$_raw_combined" ]; then
+            _folded="$(mktemp "${TMPDIR:-/tmp}/savesync_folded.XXXXXX")"
+            fold -s -w 58 "$_raw_combined" > "$_folded"
+            _total_lines="$(wc -l < "$_folded" | tr -d ' ')"
+            _page_size=15
+            _start=1
+
+            while [ "$_start" -le "$_total_lines" ]; do
+                _end=$((_start + _page_size - 1))
+                _page_txt="$(sed -n "${_start},${_end}p" "$_folded")"
+                if [ "$_end" -lt "$_total_lines" ]; then
+                    if "$PRESENTER_BIN" \
+                        --message "$_page_txt" \
+                        --font-size-default 16 \
+                        --message-alignment top \
+                        --confirm-show \
+                        --confirm-button A \
+                        --confirm-text "NEXT PAGE" \
+                        --cancel-show \
+                        --cancel-button B \
+                        --cancel-text "BACK" \
+                        --timeout 0 >/dev/null 2>&1; then
+                        _start=$((_start + _page_size))
+                    else
+                        break
+                    fi
+                else
+                    "$PRESENTER_BIN" \
+                        --message "$_page_txt" \
+                        --font-size-default 16 \
+                        --message-alignment top \
+                        --cancel-show \
+                        --cancel-button B \
+                        --cancel-text "BACK" \
+                        --timeout 0 >/dev/null 2>&1 || true
+                    break
+                fi
+            done
+            rm -f "$_folded" "$_raw_combined"
         else
+            rm -f "$_raw_combined"
             break
         fi
     done
@@ -507,6 +547,15 @@ get_mtime() {
     else
         date -r "$_file" +%s 2>/dev/null || echo 0
     fi
+}
+
+get_mtime_str() {
+    _file="$1"
+    if [ ! -e "$_file" ]; then
+        echo "none"
+        return
+    fi
+    date -r "$_file" '+%m-%d %H:%M:%S' 2>/dev/null || get_mtime "$_file"
 }
 
 # Create a BusyBox-compatible tar exclude file (-X) for save states & screenshots
@@ -973,24 +1022,36 @@ sync_file_pair() {
         return 0
     fi
 
+    _loc_name="$(basename "$_loc_file")"
+    _rem_name="$(basename "$_rem_file")"
+
     if [ "$_loc_exists" -eq 1 ] && [ "$_rem_exists" -eq 0 ]; then
-        log "[PUSH NEW] $_label: $(basename "$_loc_file")"
+        _loc_dt="$(get_mtime_str "$_loc_file")"
+        _entry="[TrimUI WON] $_label: $_loc_name (New on TrimUI [$_loc_dt] -> Knulli)"
+        log "$_entry"
+        echo "$_entry" >> "$SYNC_RESULTS_FILE"
         copy_save_with_mtime "$_loc_file" "$_rem_file"
         PUSH_COUNT=$((PUSH_COUNT + 1))
         return 0
     fi
 
     if [ "$_loc_exists" -eq 0 ] && [ "$_rem_exists" -eq 1 ]; then
-        log "[PULL NEW] $_label: $(basename "$_rem_file")"
+        _rem_dt="$(get_mtime_str "$_rem_file")"
+        _entry="[Knulli WON] $_label: $_rem_name (New on Knulli [$_rem_dt] -> TrimUI)"
+        log "$_entry"
+        echo "$_entry" >> "$SYNC_RESULTS_FILE"
         copy_save_with_mtime "$_rem_file" "$_loc_file"
         PULL_COUNT=$((PULL_COUNT + 1))
         return 0
     fi
 
+    _loc_mtime="$(get_mtime "$_loc_file")"
+    _rem_mtime="$(get_mtime "$_rem_file")"
+    _loc_dt="$(get_mtime_str "$_loc_file")"
+    _rem_dt="$(get_mtime_str "$_rem_file")"
+    _diff=$((_loc_mtime - _rem_mtime))
+
     if cmp -s "$_loc_file" "$_rem_file"; then
-        _loc_mtime="$(get_mtime "$_loc_file")"
-        _rem_mtime="$(get_mtime "$_rem_file")"
-        _diff=$((_loc_mtime - _rem_mtime))
         if [ "$_diff" -gt 2 ] || [ "$_diff" -lt -2 ]; then
             # Align timestamps if one side had a future timestamp clamped
             if [ "$_loc_mtime" -le "$_rem_mtime" ]; then
@@ -1000,23 +1061,28 @@ sync_file_pair() {
             fi
             PUSH_COUNT=$((PUSH_COUNT + 1))
         fi
+        UNCHANGED_COUNT=$((UNCHANGED_COUNT + 1))
+        echo "[IN SYNC] $_label: $_loc_name (Identical [$_loc_dt])" >> "$UNCHANGED_RESULTS_FILE"
         return 0
     fi
 
-    _loc_mtime="$(get_mtime "$_loc_file")"
-    _rem_mtime="$(get_mtime "$_rem_file")"
-    _diff=$((_loc_mtime - _rem_mtime))
-
     if [ "$_diff" -gt 2 ]; then
-        log "[PUSH UPD] $_label: $(basename "$_rem_file")"
+        _entry="[TrimUI WON] $_label: $_loc_name (TrimUI $_loc_dt > Knulli $_rem_dt)"
+        log "$_entry"
+        echo "$_entry" >> "$SYNC_RESULTS_FILE"
         copy_save_with_mtime "$_loc_file" "$_rem_file"
         PUSH_COUNT=$((PUSH_COUNT + 1))
     elif [ "$_diff" -lt -2 ]; then
-        log "[PULL UPD] $_label: $(basename "$_loc_file")"
+        _entry="[Knulli WON] $_label: $_rem_name (Knulli $_rem_dt > TrimUI $_loc_dt)"
+        log "$_entry"
+        echo "$_entry" >> "$SYNC_RESULTS_FILE"
         copy_save_with_mtime "$_rem_file" "$_loc_file"
         PULL_COUNT=$((PULL_COUNT + 1))
     else
-        log "[SKIP] $_label: $(basename "$_loc_file")"
+        _entry="[TIE/SKIP] $_label: $_loc_name (Same time [$_loc_dt])"
+        log "$_entry"
+        echo "$_entry" >> "$UNCHANGED_RESULTS_FILE"
+        UNCHANGED_COUNT=$((UNCHANGED_COUNT + 1))
     fi
 }
 
@@ -1039,8 +1105,12 @@ run_sync() {
     STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/savesync_stage.XXXXXX")"
     REMOTE_STAGE="$STAGE_DIR/remote_saves"
     PROCESSED_KEYS_FILE="$STAGE_DIR/processed_pairs.txt"
+    SYNC_RESULTS_FILE="$STAGE_DIR/sync_results.txt"
+    UNCHANGED_RESULTS_FILE="$STAGE_DIR/unchanged_results.txt"
     mkdir -p "$REMOTE_STAGE" "$LOCAL_SAVES_ROOT"
     : > "$PROCESSED_KEYS_FILE"
+    : > "$SYNC_RESULTS_FILE"
+    : > "$UNCHANGED_RESULTS_FILE"
 
     _remote_folders=""
     for _cfg in "$OVERRIDES_FILE" "$MAPPINGS_FILE"; do
@@ -1080,6 +1150,7 @@ run_sync() {
     show_ui_message "Synchronizing mapped saves..." 0
     PUSH_COUNT=0
     PULL_COUNT=0
+    UNCHANGED_COUNT=0
 
     if [ -f "$OVERRIDES_FILE" ]; then
         while IFS='|' read -r _n_dir _k_dir _n_file _k_file || [ -n "$_n_dir" ]; do
@@ -1175,6 +1246,32 @@ run_sync() {
             show_ui_message "Upload failed! Opening Debug Log..." 3
             return 1
         fi
+    fi
+
+    # Write human-readable summary of synced files and winners for the log viewer
+    SUMMARY_FILE="$PAK_DIR/last_sync_summary.txt"
+    {
+        echo "=== LAST SYNC SUMMARY ($(date '+%H:%M:%S')) ==="
+        echo "Knulli Won (Pulled): $PULL_COUNT | TrimUI Won (Pushed): $PUSH_COUNT | Unchanged: $UNCHANGED_COUNT"
+        if [ -s "$SYNC_RESULTS_FILE" ]; then
+            echo "--- Updated Saves & Winning Device ---"
+            cat "$SYNC_RESULTS_FILE"
+        else
+            echo "--- No Saves Changed (Both Devices in Sync) ---"
+        fi
+        if [ -s "$UNCHANGED_RESULTS_FILE" ]; then
+            echo "--- Already In Sync ---"
+            cat "$UNCHANGED_RESULTS_FILE"
+        fi
+    } > "$SUMMARY_FILE"
+
+    log "=== SYNCED FILES & WINNERS ==="
+    if [ -s "$SYNC_RESULTS_FILE" ]; then
+        while IFS= read -r _sline; do
+            log "$_sline"
+        done < "$SYNC_RESULTS_FILE"
+    else
+        log "No files needed updating ($UNCHANGED_COUNT save(s) already identical)."
     fi
 
     rm -rf "$STAGE_DIR"
