@@ -37,10 +37,8 @@ load_config() {
     LOCAL_SAVES_ROOT="${LOCAL_SAVES_ROOT:-$SDCARD_PATH/Saves}"
     REMOTE_SAVES_ROOT="${REMOTE_SAVES_ROOT:-/userdata/saves}"
     BACKUP_DIR="${BACKUP_DIR:-$SDCARD_PATH/Backups/SaveSync}"
-    STARTUP_MODE="${STARTUP_MODE:-menu}"
     BACKUP_KEEP_COUNT="${BACKUP_KEEP_COUNT:-3}"
     BACKUP_REMOTE="${BACKUP_REMOTE:-true}"
-    DRY_RUN="${DRY_RUN:-false}"
     ALLOWED_SAVE_EXTS="${ALLOWED_SAVE_EXTS:-sav srm rtc eep fla sra mcr mcd dsv}"
 }
 
@@ -64,8 +62,8 @@ save_config_value() {
     sync
 }
 
-# Allow CLI flag overrides (e.g., ./launch.sh --sync, --menu, --dry-run, --setup-auth)
-CLI_MODE=""
+# Optional CLI flags for automated testing (--sync, --menu, --setup-auth)
+CLI_MODE="menu"
 for arg in "$@"; do
     case "$arg" in
         --sync)
@@ -73,9 +71,6 @@ for arg in "$@"; do
             ;;
         --menu|--ui)
             CLI_MODE="menu"
-            ;;
-        --dry-run|-n)
-            DRY_RUN="true"
             ;;
         --setup-auth)
             CLI_MODE="setup-auth"
@@ -88,7 +83,7 @@ mkdir -p "$(dirname "$LOG_FILE")"
 : > "$LOG_FILE"
 
 log() {
-    _ts="$(date '+%Y-%m-%d %H:%M:%S')"
+    _ts="$(date '+%H:%M:%S')"
     echo "[$_ts] $*" | tee -a "$LOG_FILE"
 }
 
@@ -142,9 +137,9 @@ show_ui_message() {
     if [ -n "$PRESENTER_BIN" ]; then
         killall "$(basename "$PRESENTER_BIN")" >/dev/null 2>&1 || true
         if [ "$_timeout" -gt 0 ] 2>/dev/null; then
-            "$PRESENTER_BIN" --message "$_msg" --timeout "$_timeout" >/dev/null 2>&1 || true
+            "$PRESENTER_BIN" --message "$_msg" --font-size-default 22 --timeout "$_timeout" >/dev/null 2>&1 || true
         else
-            "$PRESENTER_BIN" --message "$_msg" --timeout -1 >/dev/null 2>&1 &
+            "$PRESENTER_BIN" --message "$_msg" --font-size-default 22 --timeout -1 >/dev/null 2>&1 &
         fi
     elif command -v show.elf >/dev/null 2>&1; then
         killall show.elf >/dev/null 2>&1 || true
@@ -213,59 +208,104 @@ mask_password() {
     fi
 }
 
-# On-device log & diagnostics viewer using minui-list
+# Readable on-device Debug Log viewer:
+# - Wraps long log lines into 42-char chunks so nothing is cut off by the large list font
+# - Enables horizontal marquee scrolling (`--scroll-method wrap`) in minui-list
+# - Pressing A on any line opens the full multi-line log in a small-font (16pt) presenter view!
 view_debug_logs() {
+    dismiss_ui_message
+
     if [ -z "$LIST_BIN" ]; then
         cat "$LOG_FILE"
         return 0
     fi
-    _log_view="$(mktemp "${TMPDIR:-/tmp}/savesync_logview.XXXXXX")"
-    _dummy_out="$(mktemp "${TMPDIR:-/tmp}/savesync_logout.XXXXXX")"
-    if [ -s "$LOG_FILE" ]; then
-        awk '{lines[NR]=$0} END {for(i=NR;i>=1;i--) print lines[i]}' "$LOG_FILE" > "$_log_view"
-    else
-        echo "No log entries yet." > "$_log_view"
-    fi
-    "$LIST_BIN" \
-        --file "$_log_view" \
-        --format text \
-        --title "Debug Log (Press B to return)" \
-        --write-location "$_dummy_out" >/dev/null 2>&1 || true
-    rm -f "$_log_view" "$_dummy_out"
+
+    while true; do
+        _log_view="$(mktemp "${TMPDIR:-/tmp}/savesync_logview.XXXXXX")"
+        _sel_out="$(mktemp "${TMPDIR:-/tmp}/savesync_logout.XXXXXX")"
+
+        if [ -s "$LOG_FILE" ]; then
+            # Reverse order (newest entries at top) and wrap long lines at 42 chars with indentation
+            awk '
+                { lines[NR] = $0 }
+                END {
+                    for (i = NR; i >= 1; i--) {
+                        s = lines[i]
+                        if (length(s) <= 44) {
+                            print s
+                        } else {
+                            print substr(s, 1, 44)
+                            rest = substr(s, 45)
+                            while (length(rest) > 0) {
+                                print "  " substr(rest, 1, 42)
+                                rest = substr(rest, 43)
+                            }
+                        }
+                    }
+                }
+            ' "$LOG_FILE" > "$_log_view"
+        else
+            echo "No log entries yet." > "$_log_view"
+        fi
+
+        "$LIST_BIN" \
+            --file "$_log_view" \
+            --format text \
+            --scroll-method wrap \
+            --title "Debug Log (A: Small Font View | B: Back)" \
+            --write-location "$_sel_out" >/dev/null 2>&1
+        _rc=$?
+        rm -f "$_log_view" "$_sel_out"
+
+        # If user pressed A (rc=0) and minui-presenter is available, show small-font full screen page
+        if [ "$_rc" -eq 0 ] && [ -n "$PRESENTER_BIN" ] && [ -s "$LOG_FILE" ]; then
+            _page_txt="$(tail -n 16 "$LOG_FILE" | fold -s -w 58)"
+            "$PRESENTER_BIN" \
+                --message "$_page_txt" \
+                --font-size-default 16 \
+                --message-alignment top \
+                --cancel-show \
+                --cancel-button B \
+                --cancel-text "BACK" \
+                --timeout 0 >/dev/null 2>&1 || true
+        else
+            break
+        fi
+    done
 }
 
 # Run step-by-step connection diagnostics and show results in the on-device log viewer
 run_connection_diagnostics() {
     load_config
     show_ui_message "Running diagnostics to $SSH_HOST..." 0
-    log "=== STARTING CONNECTION DIAGNOSTICS ==="
-    log "Target: ${SSH_USER}@${SSH_HOST}:${SSH_PORT}"
-    log "Local IP(s): $(ip -4 addr show 2>/dev/null | awk '/inet / {print $2}' | tr '\n' ' ' || ifconfig 2>/dev/null | awk '/inet addr/ {print $2}' || echo 'unknown')"
+    log "=== DIAGNOSTICS START ==="
+    log "Host: ${SSH_USER}@${SSH_HOST}:${SSH_PORT}"
+    log "TrimUI IP: $(ip -4 addr show 2>/dev/null | awk '/inet / && !/127.0.0.1/ {print $2}' | tr '\n' ' ' || echo 'unknown')"
 
     for _b in ssh dbclient dropbearmulti sshpass rsync tar; do
         if command -v "$_b" >/dev/null 2>&1; then
-            log "Binary [$_b]: FOUND ($(command -v "$_b"))"
+            log "Bin [$_b]: OK"
         else
-            log "Binary [$_b]: MISSING"
+            log "Bin [$_b]: MISSING"
         fi
     done
 
     if ping -c 1 -W 3 "$SSH_HOST" >/dev/null 2>&1; then
-        log "Ping [$SSH_HOST]: OK (Host is reachable on Wi-Fi)"
+        log "Ping [$SSH_HOST]: OK"
     else
-        log "Ping [$SSH_HOST]: FAILED (Host unreachable! Check Wi-Fi & IP)"
+        log "Ping [$SSH_HOST]: FAILED (Check Wi-Fi/IP)"
     fi
 
     if init_ssh_transport; then
-        log "SSH Auth [${SSH_USER}@${SSH_HOST}]: SUCCESS!"
+        log "SSH Auth: SUCCESS!"
         _rem_check="$(run_remote_cmd "ls -ld '$REMOTE_SAVES_ROOT' 2>&1" 2>&1 || true)"
-        log "Remote Saves Dir: $_rem_check"
+        log "Remote Dir: $_rem_check"
         show_ui_message "Diagnostics Passed! Connected to $SSH_HOST" 2
     else
-        log "SSH Auth [${SSH_USER}@${SSH_HOST}]: FAILED (See errors above)"
+        log "SSH Auth: FAILED (Check log above)"
         show_ui_message "Diagnostics Failed! Opening Debug Log..." 2
     fi
-    log "=== END OF DIAGNOSTICS ==="
+    log "=== DIAGNOSTICS END ==="
     view_debug_logs
 }
 
@@ -318,7 +358,6 @@ run_interactive_menu() {
 
         cat <<EOF > "$_menu_file"
 Sync Saves Now ($SSH_HOST)
-Dry-Run Sync (Test Only)
 RG28XX IP / Host: $SSH_HOST
 SSH Port: $SSH_PORT
 SSH Username: $SSH_USER
@@ -326,7 +365,6 @@ SSH Password: $_pw_masked
 Test Connection & Diagnose
 Reset & Re-install SSH Keys
 View Debug Log (savesync.log)
-Startup Mode: $STARTUP_MODE
 Backup Remote Saves: $BACKUP_REMOTE
 Exit
 EOF
@@ -334,6 +372,7 @@ EOF
         "$LIST_BIN" \
             --file "$_menu_file" \
             --format text \
+            --scroll-method wrap \
             --title "SaveSync (NextUI <-> Knulli)" \
             --write-location "$_choice_file" >/dev/null 2>&1
         _rc=$?
@@ -348,13 +387,6 @@ EOF
 
         case "$_selection" in
             "Sync Saves Now"*)
-                DRY_RUN="false"
-                if ! run_sync "sync"; then
-                    view_debug_logs
-                fi
-                ;;
-            "Dry-Run Sync"*)
-                DRY_RUN="true"
                 if ! run_sync "sync"; then
                     view_debug_logs
                 fi
@@ -397,15 +429,6 @@ EOF
                 ;;
             "View Debug Log"*)
                 view_debug_logs
-                ;;
-            "Startup Mode:"*)
-                if [ "$STARTUP_MODE" = "menu" ]; then
-                    save_config_value "STARTUP_MODE" "auto"
-                    show_ui_message "Startup Mode: auto (sync immediately)" 2
-                else
-                    save_config_value "STARTUP_MODE" "menu"
-                    show_ui_message "Startup Mode: menu (show UI on launch)" 2
-                fi
                 ;;
             "Backup Remote Saves:"*)
                 if [ "$BACKUP_REMOTE" = "true" ]; then
@@ -505,13 +528,6 @@ EOF
 }
 
 # --- SSH / Dropbear Transport Layer ---
-# CRITICAL FIX FOR DROPBEAR (`dbclient`) WHEN LAUNCHED FROM NEXTUI GUI:
-# NextUI launches paks with stdin (fd 0) closed or attached to a non-pollable handle.
-# When `dbclient` adds fd 0 to its `select()` loop, `select()` immediately returns EBADF/EINVAL
-# and `dbclient` aborts with:
-#   "dbclient: Connection to root@<IP>:22 exited: Interrupted."
-# Passing `< /dev/null` (for non-stdin commands) or a valid pipe/file on fd 0 completely prevents
-# `dbclient` from aborting!
 SSH_EXEC_WRAP="/tmp/savesync_ssh_exec.sh"
 SSH_PIPE_WRAP="/tmp/savesync_ssh_pipe.sh"
 
@@ -536,12 +552,10 @@ get_ssh_flavor() {
     return 1
 }
 
-# Execute a command on Knulli with stdin safely bound to /dev/null
 run_remote_cmd() {
     "$SSH_EXEC_WRAP" "${SSH_USER}@${SSH_HOST}" "$1" </dev/null
 }
 
-# Execute a command on Knulli while streaming caller's stdin to the remote process
 run_remote_pipe_in() {
     "$SSH_PIPE_WRAP" "${SSH_USER}@${SSH_HOST}" "$1"
 }
@@ -554,12 +568,12 @@ setup_ssh_keys() {
 
     if [ "$_flavor" = "openssh" ]; then
         if [ ! -f "$SSH_KEY_PATH" ]; then
-            log "Generating new OpenSSH key at $SSH_KEY_PATH..."
+            log "Generating OpenSSH key..."
             if command -v ssh-keygen >/dev/null 2>&1; then
                 ssh-keygen -t ed25519 -f "$SSH_KEY_PATH" -N "" -q 2>>"$LOG_FILE" || \
                 ssh-keygen -t rsa -b 2048 -f "$SSH_KEY_PATH" -N "" -q 2>>"$LOG_FILE"
             else
-                log "WARN: ssh-keygen not found for OpenSSH key generation."
+                log "WARN: ssh-keygen not found."
                 return 1
             fi
             chmod 600 "$SSH_KEY_PATH" 2>/dev/null || true
@@ -570,7 +584,7 @@ setup_ssh_keys() {
     else
         SSH_KEY_PATH="${SSH_KEY_PATH}_dropbear"
         if [ ! -f "$SSH_KEY_PATH" ]; then
-            log "Generating new Dropbear SSH key at $SSH_KEY_PATH..."
+            log "Generating Dropbear SSH key..."
             if [ -x "$PAK_DIR/bin/dropbearmulti" ]; then
                 "$PAK_DIR/bin/dropbearmulti" dropbearkey -t ed25519 -f "$SSH_KEY_PATH" >>"$LOG_FILE" 2>&1 || \
                 "$PAK_DIR/bin/dropbearmulti" dropbearkey -t rsa -f "$SSH_KEY_PATH" >>"$LOG_FILE" 2>&1
@@ -595,27 +609,27 @@ setup_ssh_keys() {
 
     _remote_install_cmd="mkdir -p ~/.ssh /userdata/system/.ssh && chmod 700 ~/.ssh /userdata/system/.ssh && for f in ~/.ssh/authorized_keys /userdata/system/.ssh/authorized_keys; do grep -qF '$_pub_key' \"\$f\" 2>/dev/null || echo '$_pub_key' >> \"\$f\"; chmod 600 \"\$f\" 2>/dev/null || true; done && (batocera-save-overlay >/dev/null 2>&1 || true)"
 
-    log "Installing SSH public key to ${SSH_USER}@${SSH_HOST}..."
+    log "Installing SSH key to ${SSH_USER}@${SSH_HOST}..."
     if command -v sshpass >/dev/null 2>&1 && [ -n "$SSH_PASSWORD" ]; then
         if [ "$_flavor" = "openssh" ]; then
             if SSHPASS="$SSH_PASSWORD" sshpass -e ssh -p "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout="$SSH_TIMEOUT" "${SSH_USER}@${SSH_HOST}" "$_remote_install_cmd" </dev/null >>"$LOG_FILE" 2>&1; then
-                log "Successfully installed SSH public key via sshpass + OpenSSH."
+                log "Installed SSH key via sshpass + OpenSSH."
                 return 0
             fi
         elif [ -x "$PAK_DIR/bin/dropbearmulti" ]; then
             if SSHPASS="$SSH_PASSWORD" sshpass -e "$PAK_DIR/bin/dropbearmulti" dbclient -p "$SSH_PORT" -y -y "${SSH_USER}@${SSH_HOST}" "$_remote_install_cmd" </dev/null >>"$LOG_FILE" 2>&1; then
-                log "Successfully installed SSH public key via sshpass + dropbearmulti."
+                log "Installed SSH key via sshpass + dropbearmulti."
                 return 0
             fi
         elif command -v dbclient >/dev/null 2>&1; then
             if SSHPASS="$SSH_PASSWORD" sshpass -e dbclient -p "$SSH_PORT" -y -y "${SSH_USER}@${SSH_HOST}" "$_remote_install_cmd" </dev/null >>"$LOG_FILE" 2>&1; then
-                log "Successfully installed SSH public key via sshpass + dbclient."
+                log "Installed SSH key via sshpass + dbclient."
                 return 0
             fi
         fi
     fi
 
-    log "WARN: Automatic key installation failed (check password or sshpass)."
+    log "WARN: Automatic key installation failed."
     return 1
 }
 
@@ -624,7 +638,7 @@ init_ssh_transport() {
     chmod 700 "$(dirname "$SSH_KEY_PATH")" 2>/dev/null || true
 
     _flavor="$(get_ssh_flavor)"
-    log "Detected SSH client flavor: $_flavor"
+    log "SSH client: $_flavor"
 
     _runtime_key="/tmp/savesync_id_key"
 
@@ -645,7 +659,7 @@ exec ssh -p "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/n
 EOF
             chmod 700 "$SSH_EXEC_WRAP" "$SSH_PIPE_WRAP"
             if [ "$(run_remote_cmd "echo SAVESYNC_OK" 2>>"$LOG_FILE" | tr -d '\r\n')" = "SAVESYNC_OK" ]; then
-                log "Connected to ${SSH_HOST} using OpenSSH key auth."
+                log "Connected to ${SSH_HOST} (OpenSSH key)."
                 return 0
             fi
         elif [ -x "$PAK_DIR/bin/dropbearmulti" ]; then
@@ -659,22 +673,20 @@ exec "$PAK_DIR/bin/dropbearmulti" dbclient -p "$SSH_PORT" -y -y -i "$_runtime_ke
 EOF
             chmod 700 "$SSH_EXEC_WRAP" "$SSH_PIPE_WRAP"
             if [ "$(run_remote_cmd "echo SAVESYNC_OK" 2>>"$LOG_FILE" | tr -d '\r\n')" = "SAVESYNC_OK" ]; then
-                log "Connected to ${SSH_HOST} using Dropbear key auth."
+                log "Connected to ${SSH_HOST} (Dropbear key)."
                 return 0
             fi
         fi
         return 1
     }
 
-    # 1. Try existing key authentication first
     if try_key_auth "$SSH_KEY_PATH" || try_key_auth "${SSH_KEY_PATH}_dropbear"; then
         return 0
     fi
 
-    # 2. Try direct password authentication via bundled sshpass
     if command -v sshpass >/dev/null 2>&1 && [ -n "$SSH_PASSWORD" ]; then
         export SSHPASS="$SSH_PASSWORD"
-        log "Testing sshpass password authentication to ${SSH_USER}@${SSH_HOST}:${SSH_PORT}..."
+        log "Testing sshpass login to ${SSH_USER}@${SSH_HOST}:${SSH_PORT}..."
 
         if [ "$_flavor" = "openssh" ]; then
             cat <<EOF > "$SSH_EXEC_WRAP"
@@ -689,7 +701,7 @@ exec "$(command -v sshpass)" -e ssh -p "$SSH_PORT" -o StrictHostKeyChecking=no -
 EOF
             chmod 700 "$SSH_EXEC_WRAP" "$SSH_PIPE_WRAP"
             if [ "$(run_remote_cmd "echo SAVESYNC_OK" 2>>"$LOG_FILE" | tr -d '\r\n')" = "SAVESYNC_OK" ]; then
-                log "Connected to ${SSH_HOST} using sshpass + OpenSSH."
+                log "Connected to ${SSH_HOST} (sshpass + OpenSSH)."
                 setup_ssh_keys >/dev/null 2>&1 || true
                 return 0
             fi
@@ -708,14 +720,13 @@ exec "$(command -v sshpass)" -e "$PAK_DIR/bin/dropbearmulti" dbclient -p "$SSH_P
 EOF
             chmod 700 "$SSH_EXEC_WRAP" "$SSH_PIPE_WRAP"
             if [ "$(run_remote_cmd "echo SAVESYNC_OK" 2>>"$LOG_FILE" | tr -d '\r\n')" = "SAVESYNC_OK" ]; then
-                log "Connected to ${SSH_HOST} using sshpass + bundled dropbearmulti (dbclient)."
+                log "Connected to ${SSH_HOST} (sshpass + dbclient)."
                 setup_ssh_keys >/dev/null 2>&1 || true
                 return 0
             fi
         fi
     fi
 
-    # 3. Try provisioning keys and re-testing key auth
     show_ui_message "Setting up SSH auth with $SSH_HOST..." 0
     if setup_ssh_keys; then
         if try_key_auth "$SSH_KEY_PATH" || try_key_auth "${SSH_KEY_PATH}_dropbear"; then
@@ -723,7 +734,7 @@ EOF
         fi
     fi
 
-    log "ERROR: Unable to connect or authenticate to ${SSH_USER}@${SSH_HOST}:${SSH_PORT}."
+    log "ERROR: Auth failed for ${SSH_USER}@${SSH_HOST}:${SSH_PORT}."
     return 1
 }
 
@@ -737,7 +748,7 @@ pull_remote_saves() {
     _flavor="$(get_ssh_flavor)"
     if [ "$_flavor" = "openssh" ] && command -v rsync >/dev/null 2>&1; then
         if run_remote_cmd "command -v rsync >/dev/null 2>&1" >>"$LOG_FILE" 2>&1; then
-            log "Using OpenSSH + rsync transport to pull remote saves..."
+            log "Pulling saves via OpenSSH + rsync..."
             _filter_args="$(build_rsync_filter_args)"
             for _k_folder in $_remote_folders; do
                 # shellcheck disable=SC2086
@@ -750,7 +761,7 @@ pull_remote_saves() {
         fi
     fi
 
-    log "Streaming remote saves from Knulli via single-connection tar-over-SSH..."
+    log "Pulling saves via tar-over-SSH..."
     _tmp_pull_tar="$STAGE_DIR/remote_pull.tar.gz"
 
     _remote_script="cd '$REMOTE_SAVES_ROOT' 2>/dev/null || exit 0; list=''; for d in $_remote_folders; do [ -d \"\$d\" ] && list=\"\$list \$d\"; done; [ -n \"\$list\" ] && tar -czf - \$list 2>/dev/null || true"
@@ -759,9 +770,9 @@ pull_remote_saves() {
 
     if [ -s "$_tmp_pull_tar" ]; then
         tar -xzf "$_tmp_pull_tar" -C "$REMOTE_STAGE" 2>>"$LOG_FILE" || true
-        log "Successfully unpacked remote saves into staging."
+        log "Unpacked remote saves into staging."
     else
-        log "Remote saves archive was empty (no existing saves found on Knulli yet)."
+        log "No existing mapped saves on Knulli yet."
     fi
     rm -f "$_tmp_pull_tar"
 }
@@ -772,7 +783,7 @@ push_remote_saves() {
     _flavor="$(get_ssh_flavor)"
     if [ "$_flavor" = "openssh" ] && command -v rsync >/dev/null 2>&1; then
         if run_remote_cmd "command -v rsync >/dev/null 2>&1" >>"$LOG_FILE" 2>&1; then
-            log "Using OpenSSH + rsync transport to push updated saves..."
+            log "Pushing saves via OpenSSH + rsync..."
             _filter_args="$(build_rsync_filter_args)"
             for _k_folder in $_remote_folders; do
                 if [ -d "$REMOTE_STAGE/$_k_folder" ] && [ -n "$(ls -A "$REMOTE_STAGE/$_k_folder" 2>/dev/null)" ]; then
@@ -788,7 +799,7 @@ push_remote_saves() {
         fi
     fi
 
-    log "Uploading updated saves to Knulli via single-connection tar-over-SSH..."
+    log "Uploading saves via tar-over-SSH..."
     _dirs_to_push=""
     for _k_folder in $_remote_folders; do
         if [ -d "$REMOTE_STAGE/$_k_folder" ] && [ -n "$(ls -A "$REMOTE_STAGE/$_k_folder" 2>/dev/null)" ]; then
@@ -803,10 +814,10 @@ push_remote_saves() {
         if [ -s "$_tmp_push_tar" ]; then
             if ! run_remote_pipe_in "mkdir -p '$REMOTE_SAVES_ROOT' && tar -xzf - -C '$REMOTE_SAVES_ROOT' && sync" < "$_tmp_push_tar" >>"$LOG_FILE" 2>&1; then
                 rm -f "$_tmp_push_tar"
-                log "ERROR: Failed to unpack pushed saves on Knulli."
+                log "ERROR: Failed to unpack saves on Knulli."
                 return 1
             fi
-            log "Successfully uploaded and unpacked saves on Knulli!"
+            log "Uploaded & unpacked saves on Knulli!"
         fi
         rm -f "$_tmp_push_tar"
     fi
@@ -822,7 +833,7 @@ rotate_backups() {
     for _archive in $(ls -1r "$BACKUP_DIR/${_prefix}_"*.tar.gz 2>/dev/null || true); do
         _count=$((_count + 1))
         if [ "$_count" -gt "$_keep" ]; then
-            log "Rotating old backup: removing $(basename "$_archive")"
+            log "Rotate backup: rm $(basename "$_archive")"
             rm -f "$_archive"
         fi
     done
@@ -837,7 +848,7 @@ create_backups() {
 
     if [ -d "$LOCAL_SAVES_ROOT" ] && [ -n "$(ls -A "$LOCAL_SAVES_ROOT" 2>/dev/null)" ]; then
         _local_archive="$BACKUP_DIR/local_${_run_ts}.tar.gz"
-        log "Creating compressed local backup: $_local_archive"
+        log "Backup local: $(basename "$_local_archive")"
         tar -czf "$_local_archive" -X "$_ex_file" -C "$LOCAL_SAVES_ROOT" . >>"$LOG_FILE" 2>&1 || \
         tar -czf "$_local_archive" -C "$LOCAL_SAVES_ROOT" . >>"$LOG_FILE" 2>&1 || true
         rotate_backups "local"
@@ -845,7 +856,7 @@ create_backups() {
 
     if [ "$BACKUP_REMOTE" = "true" ] && [ -d "$_remote_stage_raw" ] && [ -n "$(ls -A "$_remote_stage_raw" 2>/dev/null)" ]; then
         _remote_archive="$BACKUP_DIR/remote_${_run_ts}.tar.gz"
-        log "Creating compressed remote backup: $_remote_archive"
+        log "Backup remote: $(basename "$_remote_archive")"
         tar -czf "$_remote_archive" -X "$_ex_file" -C "$_remote_stage_raw" . >>"$LOG_FILE" 2>&1 || \
         tar -czf "$_remote_archive" -C "$_remote_stage_raw" . >>"$LOG_FILE" 2>&1 || true
         rotate_backups "remote"
@@ -881,19 +892,15 @@ sync_file_pair() {
     fi
 
     if [ "$_loc_exists" -eq 1 ] && [ "$_rem_exists" -eq 0 ]; then
-        log "[PUSH NEW] $_label: NextUI -> Knulli ($(basename "$_loc_file") -> $(basename "$_rem_file"))"
-        if [ "$DRY_RUN" != "true" ]; then
-            copy_save_with_mtime "$_loc_file" "$_rem_file"
-        fi
+        log "[PUSH NEW] $_label: $(basename "$_loc_file")"
+        copy_save_with_mtime "$_loc_file" "$_rem_file"
         PUSH_COUNT=$((PUSH_COUNT + 1))
         return 0
     fi
 
     if [ "$_loc_exists" -eq 0 ] && [ "$_rem_exists" -eq 1 ]; then
-        log "[PULL NEW] $_label: Knulli -> NextUI ($(basename "$_rem_file") -> $(basename "$_loc_file"))"
-        if [ "$DRY_RUN" != "true" ]; then
-            copy_save_with_mtime "$_rem_file" "$_loc_file"
-        fi
+        log "[PULL NEW] $_label: $(basename "$_rem_file")"
+        copy_save_with_mtime "$_rem_file" "$_loc_file"
         PULL_COUNT=$((PULL_COUNT + 1))
         return 0
     fi
@@ -907,19 +914,15 @@ sync_file_pair() {
     _diff=$((_loc_mtime - _rem_mtime))
 
     if [ "$_diff" -gt 2 ]; then
-        log "[PUSH UPDATE] $_label: NextUI is newer ($_loc_mtime > $_rem_mtime) -> updating Knulli ($(basename "$_rem_file"))"
-        if [ "$DRY_RUN" != "true" ]; then
-            copy_save_with_mtime "$_loc_file" "$_rem_file"
-        fi
+        log "[PUSH UPD] $_label: $(basename "$_rem_file")"
+        copy_save_with_mtime "$_loc_file" "$_rem_file"
         PUSH_COUNT=$((PUSH_COUNT + 1))
     elif [ "$_diff" -lt -2 ]; then
-        log "[PULL UPDATE] $_label: Knulli is newer ($_rem_mtime > $_loc_mtime) -> updating NextUI ($(basename "$_loc_file"))"
-        if [ "$DRY_RUN" != "true" ]; then
-            copy_save_with_mtime "$_rem_file" "$_loc_file"
-        fi
+        log "[PULL UPD] $_label: $(basename "$_loc_file")"
+        copy_save_with_mtime "$_rem_file" "$_loc_file"
         PULL_COUNT=$((PULL_COUNT + 1))
     else
-        log "[SKIP] $_label: Timestamps within 2s tolerance ($_loc_mtime vs $_rem_mtime), keeping both as-is."
+        log "[SKIP] $_label: $(basename "$_loc_file")"
     fi
 }
 
@@ -962,7 +965,7 @@ run_sync() {
     done
 
     show_ui_message "Fetching saves from Knulli ($SSH_HOST)..." 0
-    log "Pulling remote saves from ${SSH_USER}@${SSH_HOST}:${REMOTE_SAVES_ROOT} into staging..."
+    log "Pulling saves from ${SSH_HOST}:${REMOTE_SAVES_ROOT}..."
 
     run_remote_cmd "mkdir -p '$REMOTE_SAVES_ROOT'" >>"$LOG_FILE" 2>&1 || true
 
@@ -975,12 +978,8 @@ run_sync() {
     done
 
     RUN_TS="$(date '+%Y%m%d_%H%M%S')"
-    if [ "$DRY_RUN" != "true" ]; then
-        show_ui_message "Creating rolling backup ($RUN_TS)..." 0
-        create_backups "$RUN_TS" "$REMOTE_STAGE"
-    else
-        log "[DRY-RUN] Skipping backup archive creation."
-    fi
+    show_ui_message "Creating rolling backup ($RUN_TS)..." 0
+    create_backups "$RUN_TS" "$REMOTE_STAGE"
 
     show_ui_message "Synchronizing mapped saves..." 0
     PUSH_COUNT=0
@@ -997,7 +996,7 @@ run_sync() {
             _loc_path="$LOCAL_SAVES_ROOT/$_n_dir/$_n_file"
             _rem_path="$REMOTE_STAGE/$_k_dir/$_k_file"
 
-            sync_file_pair "$_loc_path" "$_rem_path" "Override($_n_dir<->$_k_dir)"
+            sync_file_pair "$_loc_path" "$_rem_path" "Ovr($_n_dir)"
             echo "LOC:$_loc_path" >> "$PROCESSED_KEYS_FILE"
             echo "REM:$_rem_path" >> "$PROCESSED_KEYS_FILE"
         done < "$OVERRIDES_FILE"
@@ -1030,7 +1029,7 @@ run_sync() {
                             [ -n "$_game_base" ] || continue
                             _target_rem_f="$_rem_sys_dir/${_game_base}${_k_suf}"
 
-                            sync_file_pair "$_loc_f" "$_target_rem_f" "$_n_dir<->$_k_dir"
+                            sync_file_pair "$_loc_f" "$_target_rem_f" "$_n_dir"
                             echo "LOC:$_loc_f" >> "$PROCESSED_KEYS_FILE"
                             echo "REM:$_target_rem_f" >> "$PROCESSED_KEYS_FILE"
                             ;;
@@ -1055,12 +1054,12 @@ run_sync() {
 
                             _existing_loc="$(find_existing_local_save "$_k_dir" "$_game_base" "$_k_suf")"
                             if [ -n "$_existing_loc" ]; then
-                                sync_file_pair "$_existing_loc" "$_rem_f" "$_n_dir<->$_k_dir"
+                                sync_file_pair "$_existing_loc" "$_rem_f" "$_n_dir"
                                 echo "LOC:$_existing_loc" >> "$PROCESSED_KEYS_FILE"
                                 echo "REM:$_rem_f" >> "$PROCESSED_KEYS_FILE"
                             else
                                 _best_loc="$(resolve_new_local_save_path "$_k_dir" "$_game_base" "$_k_suf" "$_n_dir" "$_n_suf")"
-                                sync_file_pair "$_best_loc" "$_rem_f" "$_n_dir<->$_k_dir"
+                                sync_file_pair "$_best_loc" "$_rem_f" "$_n_dir"
                                 echo "LOC:$_best_loc" >> "$PROCESSED_KEYS_FILE"
                                 echo "REM:$_rem_f" >> "$PROCESSED_KEYS_FILE"
                             fi
@@ -1071,9 +1070,9 @@ run_sync() {
         done < "$MAPPINGS_FILE"
     fi
 
-    if [ "$DRY_RUN" != "true" ] && [ "$PUSH_COUNT" -gt 0 ]; then
+    if [ "$PUSH_COUNT" -gt 0 ]; then
         show_ui_message "Uploading $PUSH_COUNT save(s) to Knulli..." 0
-        log "Pushing $PUSH_COUNT updated save(s) to ${SSH_USER}@${SSH_HOST}:${REMOTE_SAVES_ROOT}..."
+        log "Pushing $PUSH_COUNT save(s) to ${SSH_HOST}..."
         if ! push_remote_saves "$_remote_folders"; then
             rm -rf "$STAGE_DIR"
             STAGE_DIR=""
@@ -1086,7 +1085,6 @@ run_sync() {
     STAGE_DIR=""
     sync
     _summary="Sync Complete! Pulled: $PULL_COUNT | Pushed: $PUSH_COUNT"
-    [ "$DRY_RUN" = "true" ] && _summary="[DRY RUN] Pulled: $PULL_COUNT | Pushed: $PUSH_COUNT"
     show_ui_message "$_summary" 3
     log "$_summary"
     return 0
@@ -1148,23 +1146,15 @@ resolve_new_local_save_path() {
     echo "$LOCAL_SAVES_ROOT/$_fallback_n_dir/${_game_base}${_fallback_n_suf}"
 }
 
-# --- Main Entrypoint ---
-EFFECTIVE_MODE="${CLI_MODE:-$STARTUP_MODE}"
-case "$EFFECTIVE_MODE" in
-    menu|ui)
-        run_interactive_menu
+# --- Main Entrypoint (Always opens interactive menu unless CLI flag passed) ---
+case "$CLI_MODE" in
+    sync)
+        run_sync "sync"
         ;;
     setup-auth)
         run_connection_diagnostics
         ;;
-    sync|auto|*)
-        if ! run_sync "sync"; then
-            if [ -n "$LIST_BIN" ]; then
-                view_debug_logs
-                run_interactive_menu
-            else
-                exit 1
-            fi
-        fi
+    menu|ui|*)
+        run_interactive_menu
         ;;
 esac

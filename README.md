@@ -8,8 +8,8 @@ A self-contained **NextUI Tool Pak (`SaveSync.pak`)** for the **TrimUI Brick (`t
 
 1. **Interactive On-Device UI & On-Screen Keyboard**:
    - Powered by `minui-list`, `minui-keyboard`, and `minui-presenter` (native NextUI/MinUI `tg5040` theme-aware UI utilities).
-   - Configure your **RG28XX IP / Hostname**, **SSH Port**, **SSH Username**, and **SSH Password** directly on the TrimUI Brick screen using the D-pad and buttons (`A` to select/type, `B` to cancel/back) without needing a computer to edit config files.
-   - Choose between **Menu Mode** (`STARTUP_MODE="menu"`, opens the interactive UI on launch) or **Auto Mode** (`STARTUP_MODE="auto"`, immediately syncs on launch and only opens the UI menu if the connection fails).
+   - Always launches directly into the interactive menu. Configure your **RG28XX IP / Hostname**, **SSH Port**, **SSH Username**, and **SSH Password** directly on the TrimUI Brick screen using the D-pad and buttons (`A` to select/type, `B` to cancel/back) without needing a computer to edit config files.
+   - Includes a readable **On-Device Debug Log Viewer** that wraps long log lines into indented multi-line rows in the list view and supports pressing `A` for a small-font (`16pt`) full-screen view.
 2. **Automatic SSH Login & First-Run Key Provisioning**:
    - Uses your RG28XX's built-in Knulli SSH server (`root@KNULLI.local` or IP address).
    - Automatically generates an Ed25519/RSA key pair (`SaveSync.pak/.ssh/id_save_sync`) on first launch, logs into Knulli using your configured password (`linux` by default), installs the public key into `~/.ssh/authorized_keys`, and calls `batocera-save-overlay` so passwordless login persists across RG28XX reboots.
@@ -69,13 +69,13 @@ Copy the `Tools/tg5040/SaveSync.pak` folder onto your TrimUI Brick MicroSD card 
 2. Turn on your **TrimUI Brick (NextUI)**, navigate to **Tools -> SaveSync (Knulli)**, and press **A**.
 3. Use the on-screen menu to configure or run:
    - **Sync Saves Now (`<Host>`)**: Runs the backup and bidirectional save synchronization.
-   - **Dry-Run Sync (Test Only)**: Simulates the sync without modifying files.
+   - **View Debug Log (Last Run)**: Inspects the latest sync log with wrapped lines (`Up`/`Down` to scroll, `A` for small-font full-screen view, `X` to clear log, `B` to go back).
    - **RG28XX IP / Host**: Opens the on-screen keyboard to enter your RG28XX IP address (e.g. `192.168.1.50` or `KNULLI.local`).
    - **SSH Port**: Opens the on-screen keyboard to edit the SSH port (default `22`).
    - **SSH Username**: Opens the on-screen keyboard to edit the SSH username (default `root`).
    - **SSH Password**: Opens the on-screen keyboard to edit the SSH password (default `linux`).
    - **Test & Setup SSH Key Auth**: Tests the SSH connection and installs the passwordless SSH key on your RG28XX.
-   - **Startup Mode (`menu` / `auto`)**: Toggle whether launching the pak opens this menu first (`menu`) or immediately runs a sync (`auto`).
+   - **Reset / Re-pair SSH Key on Knulli**: Clears cached local keys and reprovisions fresh SSH key authentication on your RG28XX.
    - **Backup Remote Saves (`true` / `false`)**: Toggle whether Knulli remote saves are backed up alongside local NextUI saves.
 
 ---
