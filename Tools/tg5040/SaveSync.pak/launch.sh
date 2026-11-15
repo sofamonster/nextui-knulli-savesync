@@ -898,6 +898,67 @@ copy_save_with_mtime() {
     touch -r "$_src" "$_dst" 2>/dev/null || true
 }
 
+# Clamp or reset future timestamps (e.g. from NGPC emulator clock/TZ offset)
+# - If a file has a future timestamp (> now + 60s) AND is unchanged compared to the last backup,
+#   reset its mtime back to the last backup's timestamp so a newer save on the other device can win.
+# - If a file has a future timestamp AND was newly modified since the last backup,
+#   clamp its mtime to 'now' so it wins this sync cleanly without leaving a future timestamp behind.
+sanitize_future_timestamps() {
+    _now="$(date +%s)"
+    _max_allowed=$((_now + 60))
+    _prev_loc_tar="$(ls -1r "$BACKUP_DIR"/local_*.tar.gz 2>/dev/null | head -n 1 || true)"
+    _prev_rem_tar="$(ls -1r "$BACKUP_DIR"/remote_*.tar.gz 2>/dev/null | head -n 1 || true)"
+    _prev_loc_dir="$STAGE_DIR/prev_loc_check"
+    _prev_rem_dir="$STAGE_DIR/prev_rem_check"
+
+    if [ -d "$LOCAL_SAVES_ROOT" ]; then
+        find "$LOCAL_SAVES_ROOT" -type f | while IFS= read -r _lf; do
+            is_allowed_save_file "$(basename "$_lf")" || continue
+            _mt="$(get_mtime "$_lf")"
+            if [ "$_mt" -gt "$_max_allowed" ]; then
+                if [ -n "$_prev_loc_tar" ] && [ -f "$_prev_loc_tar" ]; then
+                    if [ ! -d "$_prev_loc_dir" ]; then
+                        mkdir -p "$_prev_loc_dir"
+                        tar -xzf "$_prev_loc_tar" -C "$_prev_loc_dir" 2>/dev/null || true
+                    fi
+                    _rel="${_lf#"$LOCAL_SAVES_ROOT"/}"
+                    if [ -f "$_prev_loc_dir/$_rel" ] && cmp -s "$_lf" "$_prev_loc_dir/$_rel"; then
+                        log "[TIME FIX] Reset leftover future local mtime: $(basename "$_lf")"
+                        touch -r "$_prev_loc_tar" "$_lf" 2>/dev/null || touch "$_lf" 2>/dev/null || true
+                        continue
+                    fi
+                fi
+                log "[TIME FIX] Clamped future local mtime to now: $(basename "$_lf")"
+                touch "$_lf" 2>/dev/null || true
+            fi
+        done
+    fi
+
+    if [ -d "$REMOTE_STAGE" ]; then
+        find "$REMOTE_STAGE" -type f | while IFS= read -r _rf; do
+            is_allowed_save_file "$(basename "$_rf")" || continue
+            _mt="$(get_mtime "$_rf")"
+            if [ "$_mt" -gt "$_max_allowed" ]; then
+                : > "$STAGE_DIR/remote_time_fixed.flag"
+                if [ -n "$_prev_rem_tar" ] && [ -f "$_prev_rem_tar" ]; then
+                    if [ ! -d "$_prev_rem_dir" ]; then
+                        mkdir -p "$_prev_rem_dir"
+                        tar -xzf "$_prev_rem_tar" -C "$_prev_rem_dir" 2>/dev/null || true
+                    fi
+                    _rel="${_rf#"$REMOTE_STAGE"/}"
+                    if [ -f "$_prev_rem_dir/$_rel" ] && cmp -s "$_rf" "$_prev_rem_dir/$_rel"; then
+                        log "[TIME FIX] Reset leftover future remote mtime: $(basename "$_rf")"
+                        touch -r "$_prev_rem_tar" "$_rf" 2>/dev/null || touch "$_rf" 2>/dev/null || true
+                        continue
+                    fi
+                fi
+                log "[TIME FIX] Clamped future remote mtime to now: $(basename "$_rf")"
+                touch "$_rf" 2>/dev/null || true
+            fi
+        done
+    fi
+}
+
 sync_file_pair() {
     _loc_file="$1"
     _rem_file="$2"
@@ -927,6 +988,18 @@ sync_file_pair() {
     fi
 
     if cmp -s "$_loc_file" "$_rem_file"; then
+        _loc_mtime="$(get_mtime "$_loc_file")"
+        _rem_mtime="$(get_mtime "$_rem_file")"
+        _diff=$((_loc_mtime - _rem_mtime))
+        if [ "$_diff" -gt 2 ] || [ "$_diff" -lt -2 ]; then
+            # Align timestamps if one side had a future timestamp clamped
+            if [ "$_loc_mtime" -le "$_rem_mtime" ]; then
+                touch -r "$_loc_file" "$_rem_file" 2>/dev/null || true
+            else
+                touch -r "$_rem_file" "$_loc_file" 2>/dev/null || true
+            fi
+            PUSH_COUNT=$((PUSH_COUNT + 1))
+        fi
         return 0
     fi
 
@@ -997,6 +1070,8 @@ run_sync() {
             rm -f "$_rf"
         fi
     done
+
+    sanitize_future_timestamps
 
     RUN_TS="$(date '+%Y%m%d_%H%M%S')"
     show_ui_message "Creating rolling backup ($RUN_TS)..." 0
@@ -1091,7 +1166,7 @@ run_sync() {
         done < "$MAPPINGS_FILE"
     fi
 
-    if [ "$PUSH_COUNT" -gt 0 ]; then
+    if [ "$PUSH_COUNT" -gt 0 ] || [ -f "$STAGE_DIR/remote_time_fixed.flag" ]; then
         show_ui_message "Uploading $PUSH_COUNT save(s) to Knulli..." 0
         log "Pushing $PUSH_COUNT save(s) to ${SSH_HOST}..."
         if ! push_remote_saves "$_remote_folders"; then

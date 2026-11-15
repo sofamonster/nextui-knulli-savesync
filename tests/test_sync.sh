@@ -290,4 +290,29 @@ assert_file_missing "$REMOTE_MOCK/gba/NewPostBackupGame.srm"
 assert_file_content "$SDCARD_MOCK/Saves/GBA/Metroid Fusion.st0" "local_state"
 assert_file_content "$REMOTE_MOCK/gba/Metroid Fusion.state" "state_data"
 
+echo "=== Testing NGPC Future Timestamp Clamping & Recovery ==="
+mkdir -p "$SDCARD_MOCK/Saves/NGPC" "$REMOTE_MOCK/ngpc"
+echo "ngpc_save_v1_future" > "$SDCARD_MOCK/Saves/NGPC/Metal Slug.ngf"
+touch -d "+2 hours" "$SDCARD_MOCK/Saves/NGPC/Metal Slug.ngf"
+
+PATH="$NO_RSYNC_BIN" SDCARD_PATH="$SDCARD_MOCK" "$TEST_PAK/launch.sh" --sync
+assert_file_content "$REMOTE_MOCK/ngpc/Metal Slug.flash" "ngpc_save_v1_future"
+
+NOW_EPOCH="$(date +%s)"
+CLAMPED_MTIME="$(stat -c %Y "$SDCARD_MOCK/Saves/NGPC/Metal Slug.ngf")"
+if [ "$CLAMPED_MTIME" -gt $((NOW_EPOCH + 60)) ]; then
+    echo "[FAIL] Future timestamp was not clamped: $CLAMPED_MTIME > $NOW_EPOCH"
+    exit 1
+fi
+echo "[PASS] Future local NGPC timestamp clamped to current time ($CLAMPED_MTIME <= $NOW_EPOCH)"
+
+# Now simulate playing on Knulli with a normal timestamp, even if local file had a leftover future timestamp
+sleep 2
+touch -d "+3 hours" "$SDCARD_MOCK/Saves/NGPC/Metal Slug.ngf"
+echo "ngpc_save_v2_knulli_normal_time" > "$REMOTE_MOCK/ngpc/Metal Slug.flash"
+touch "$REMOTE_MOCK/ngpc/Metal Slug.flash"
+
+PATH="$NO_RSYNC_BIN" SDCARD_PATH="$SDCARD_MOCK" "$TEST_PAK/launch.sh" --sync
+assert_file_content "$SDCARD_MOCK/Saves/NGPC/Metal Slug.ngf" "ngpc_save_v2_knulli_normal_time"
+
 echo "=== ALL SAVESYNC TESTS PASSED SUCCESSFULLY ==="
